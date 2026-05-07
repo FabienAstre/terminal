@@ -333,25 +333,59 @@ def fetch_market_overview() -> dict:
 
 @st.cache_data(ttl=1800)
 def fetch_stocktwits_sentiment(ticker: str) -> dict:
-    """Fetch StockTwits sentiment — free, no auth needed for basic data."""
-    url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+    """
+    Fetch StockTwits sentiment with sparkline data.
+    Returns per-message timestamps so we can build a sentiment trend over time.
+    """
+    url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json?limit=30"
     try:
         resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
-            return {"bullish": 0, "bearish": 0, "total": 0, "bull_pct": 50, "available": False}
+            return {"bullish": 0, "bearish": 0, "total": 0, "bull_pct": 50,
+                    "available": False, "sparkline": []}
         data = resp.json()
         messages = data.get("messages", [])
-        bullish = sum(1 for m in messages if m.get("entities", {}).get("sentiment", {}) and m["entities"]["sentiment"].get("basic") == "Bullish")
-        bearish = sum(1 for m in messages if m.get("entities", {}).get("sentiment", {}) and m["entities"]["sentiment"].get("basic") == "Bearish")
-        total = bullish + bearish
+
+        bullish = bearish = 0
+        # Build sparkline: rolling 5-message bull% over time
+        spark_points = []
+        window = []
+        for m in messages:
+            sent = m.get("entities", {}).get("sentiment", {})
+            if sent:
+                val = sent.get("basic", "")
+                if val == "Bullish":
+                    bullish += 1
+                    window.append(1)
+                elif val == "Bearish":
+                    bearish += 1
+                    window.append(0)
+                if len(window) >= 3:
+                    spark_points.append(round(sum(window[-5:]) / len(window[-5:]) * 100, 0))
+            else:
+                # No sentiment tag — neutral, don't add to window
+                if len(window) >= 3:
+                    spark_points.append(round(sum(window[-5:]) / len(window[-5:]) * 100, 0))
+
+        total    = bullish + bearish
         bull_pct = round(bullish / total * 100, 1) if total > 0 else 50
+
+        # Trend direction from sparkline
+        spark_trend = "rising" if (len(spark_points) >= 3 and spark_points[-1] > spark_points[0]) else (
+                      "falling" if (len(spark_points) >= 3 and spark_points[-1] < spark_points[0]) else "flat")
+
         return {
-            "bullish": bullish, "bearish": bearish,
-            "total": len(messages), "bull_pct": bull_pct,
-            "available": True,
+            "bullish":    bullish,
+            "bearish":    bearish,
+            "total":      len(messages),
+            "bull_pct":   bull_pct,
+            "available":  True,
+            "sparkline":  spark_points[-10:],  # last 10 points
+            "spark_trend": spark_trend,
         }
     except Exception:
-        return {"bullish": 0, "bearish": 0, "total": 0, "bull_pct": 50, "available": False}
+        return {"bullish": 0, "bearish": 0, "total": 0, "bull_pct": 50,
+                "available": False, "sparkline": [], "spark_trend": "flat"}
 
 
 @st.cache_data(ttl=3600)
@@ -672,6 +706,10 @@ with st.sidebar:
         "📡 Momentum Scanner",
         "💬 Social Sentiment",
         "🏢 Sector Drill-Down",
+        "📈 Stock Screener",
+        "⚠️ Portfolio Risk Monitor",
+        "🔔 Alert System",
+        "📅 Economic Calendar",
         "📄 Earnings Reviewer",
         "🏦 Market Researcher",
     ])
@@ -936,10 +974,24 @@ elif page == "💬 Social Sentiment":
                         f'<div style="margin-bottom:8px">'
                         f'<div style="font-size:10px;color:#555;text-transform:uppercase;margin-bottom:3px">StockTwits</div>'
                         + (
-                            f'<div style="font-size:12px;color:#aaa">'
-                            f'{st_d["total"]} messages · '
-                            f'<b style="color:{"#00e676" if st_d["bull_pct"]>=50 else "#ff5252"}">{st_d["bull_pct"]:.0f}% bullish</b>'
-                            f'</div>'
+                            (lambda sd: (
+                                f'<div style="font-size:12px;color:#aaa">'
+                                f'{sd["total"]} msgs · '
+                                f'<b style="color:{"#00e676" if sd["bull_pct"]>=50 else "#ff5252"}">{sd["bull_pct"]:.0f}% bullish</b>'
+                                + (f' <span style="color:{"#00e676" if sd.get("spark_trend")=="rising" else ("#ff5252" if sd.get("spark_trend")=="falling" else "#888")}">'
+                                   f'{"↑" if sd.get("spark_trend")=="rising" else ("↓" if sd.get("spark_trend")=="falling" else "→")}</span>' if sd.get("sparkline") else "")
+                                + f'</div>'
+                                + (
+                                    '<div style="display:flex;align-items:flex-end;gap:1px;height:18px;margin-top:4px">'
+                                    + "".join(
+                                        f'<div style="flex:1;background:{"#00e676" if p>=50 else "#ff5252"};'
+                                        f'height:{max(int(p/100*18),2)}px;border-radius:1px;opacity:0.7"></div>'
+                                        for p in sd.get("sparkline", [])
+                                    )
+                                    + '</div>'
+                                    if sd.get("sparkline") else ""
+                                )
+                            ))(st_d)
                             if st_d["available"] else
                             f'<div style="font-size:11px;color:#555">No data</div>'
                         ) +
@@ -1120,6 +1172,13 @@ elif page == "📄 Earnings Reviewer":
         search_filings = st.button("🔍 Find Filings", type="primary")
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # Auto-load: trigger search automatically when ticker changes
+    last_ticker = st.session_state.get("last_earnings_ticker", "")
+    if ticker_input and ticker_input != last_ticker:
+        st.session_state["last_earnings_ticker"] = ticker_input
+        st.session_state.pop("filings", None)
+        st.session_state.pop("filing_ticker", None)
+
     if search_filings and ticker_input:
         with st.spinner(f"Looking up {ticker_input} on SEC EDGAR…"):
             cik = get_cik_from_ticker(ticker_input)
@@ -1128,13 +1187,17 @@ elif page == "📄 Earnings Reviewer":
             st.error(f"Could not find {ticker_input} on SEC EDGAR. Verify the ticker is a US-listed company.")
         else:
             st.success(f"Found: **{ticker_input}** → CIK `{cik}`")
-            st.session_state["cik"] = cik
-            st.session_state["filing_ticker"] = ticker_input
-            st.session_state["form_type"] = form_type
+            st.session_state["cik"]            = cik
+            st.session_state["filing_ticker"]  = ticker_input
+            st.session_state["form_type"]      = form_type
 
             with st.spinner(f"Fetching recent {form_type} filings…"):
                 filings = get_recent_filings(cik, form_type=form_type, count=8)
             st.session_state["filings"] = filings
+
+            # Auto-select most recent and auto-analyse if it's an 8-K
+            if filings and form_type == "8-K":
+                st.session_state["auto_analyse"] = True
 
     # Show filings if available
     if "filings" in st.session_state and st.session_state.get("filing_ticker") == ticker_input:
@@ -1143,14 +1206,24 @@ elif page == "📄 Earnings Reviewer":
             st.warning(f"No {form_type} filings found for {ticker_input}.")
         else:
             st.markdown(f"### 📁 Recent {form_type} Filings — {ticker_input}")
+
+            # Quick stats
+            dates = [f["date"] for f in filings]
+            st.caption(f"📅 Most recent: **{dates[0]}** · {len(filings)} filings found · Showing most recent first")
+
             filing_labels = [f"{f['date']} — {f['form']} ({f['accession'][:12]}…)" for f in filings]
-            selected_label = st.selectbox("Select filing to analyse", filing_labels)
+            # Default to most recent (index 0)
+            default_idx   = 0
+            selected_label = st.selectbox("Select filing to analyse", filing_labels, index=default_idx)
             selected_idx   = filing_labels.index(selected_label)
             selected_filing = filings[selected_idx]
 
             col_a, col_b = st.columns([1, 4])
             with col_a:
                 run_analysis = st.button("🤖 Analyse with AI", type="primary")
+            # Auto-trigger on fresh load of most recent 8-K
+            if st.session_state.pop("auto_analyse", False) and selected_idx == 0:
+                run_analysis = True
             with col_b:
                 acc = selected_filing["accession"]
                 cik_val = int(selected_filing["cik"])
@@ -2118,6 +2191,22 @@ if page == "🌍 Macro Dashboard":
     st.markdown("# 🌍 Macro Dashboard")
     st.caption(f"Global macro pulse — rates, dollar, commodities, volatility, risk appetite · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
+    with st.expander("ℹ️ How to read this dashboard — plain English guide"):
+        st.markdown("""
+**This dashboard gives you the macro backdrop before you make any trade. Think of it as the weather forecast — you wouldn't ignore a storm warning just because your stock looks bullish.**
+
+| Signal | What it measures | Why it matters |
+|--------|-----------------|----------------|
+| **VIX** | Market's expectation of volatility over next 30 days | High VIX = fear and uncertainty = bad time to buy aggressively |
+| **Yield Curve (2Y/10Y)** | Difference between short and long-term rates | Inverted = banks stop lending = recession risk |
+| **Fear & Greed** | Composite of 7 market sentiment indicators | Extreme Greed = crowded trade, consider trimming. Extreme Fear = potential opportunity |
+| **DXY (Dollar)** | US dollar strength vs basket of currencies | Strong dollar hurts commodities, gold, emerging markets |
+| **Gold/Oil ratio** | Gold price divided by oil price | High ratio = defensive positioning. Low ratio = growth/risk-on |
+| **Bitcoin** | Speculative risk appetite proxy | BTC rising strongly = risk appetite healthy across markets |
+| **Credit Spread** | Junk bonds (HYG) vs investment grade (IEI) | Junk outperforming = credit markets confident = risk-on |
+| **VIX Term Structure** | Near-term VIX vs 3-month VIX | Backwardation (near > far) = immediate fear spike, potential buying opportunity after resolution |
+        """)
+
     with st.spinner("Fetching macro data…"):
         macro = fetch_macro_data()
         fg    = fetch_fear_greed()
@@ -2128,6 +2217,8 @@ if page == "🌍 Macro Dashboard":
 
     # ── Fear & Greed ──────────────────────────────────────────────────────────
     st.markdown("### 😨 CNN Fear & Greed Index")
+    st.caption("Composite of 7 indicators: stock momentum, put/call ratio, market breadth, junk bond demand, safe haven flows, stock price strength, and market volatility.")
+
     if fg["available"]:
         fg_score = fg["score"]
         if fg_score >= 75:   fg_c, fg_label = "#ff6b35", "Extreme Greed"
@@ -2160,7 +2251,6 @@ if page == "🌍 Macro Dashboard":
                 f'<div style="font-size:11px;color:{vc}">{vl}</div>'
                 f'</div>', unsafe_allow_html=True)
 
-        # Trend arrow
         trend = fg_score - fg["prev_1w"]
         trend_c = "#00e676" if trend > 5 else ("#ff5252" if trend < -5 else "#ffd740")
         fgc5.markdown(
@@ -2169,13 +2259,37 @@ if page == "🌍 Macro Dashboard":
             f'<div style="font-size:36px;font-weight:900;color:{trend_c}">{"▲" if trend > 0 else "▼"}</div>'
             f'<div style="font-size:13px;color:{trend_c}">{trend:+.1f} pts</div>'
             f'</div>', unsafe_allow_html=True)
+
+        # Plain language interpretation
+        fg_explain = {
+            "Extreme Greed": "⚠️ **Extreme Greed** — everyone is bullish, which historically means the easy money has been made. This is not a time to chase — it's a time to trim winners and raise cash. Corrections tend to follow Extreme Greed readings within 2-4 weeks.",
+            "Greed":         "🟡 **Greed** — markets are running hot. Still OK to hold positions but be selective about adding new ones. Watch for any catalyst that could flip sentiment.",
+            "Neutral":       "➖ **Neutral** — no strong signal either way. Markets are balanced between buyers and sellers. Focus on individual stock setups rather than macro timing.",
+            "Fear":          "🟢 **Fear** — investors are nervous. Historically this is a better time to be buying than selling. Fear creates opportunity — good stocks go on sale.",
+            "Extreme Fear":  "🟢 **Extreme Fear** — historically one of the best times to buy quality assets. Most people are selling, which means prices are depressed. The hardest trade to make is often the right one.",
+        }
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {fg_c};border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-top:10px;font-size:13px;color:#aaa">'
+            f'{fg_explain.get(fg_label, "")}</div>', unsafe_allow_html=True)
     else:
-        st.info("Fear & Greed data unavailable — CNN API may be rate limiting.")
+        st.info("Fear & Greed data unavailable — CNN API may be rate limiting. Try refreshing in a few minutes.")
+        st.markdown(
+            '<div style="background:#1c1f26;border-left:4px solid #555;border-radius:0 10px 10px 0;'
+            'padding:12px 16px;font-size:13px;color:#aaa">'
+            '<b style="color:#ddd">What is the Fear & Greed Index?</b><br>'
+            "CNN's composite sentiment indicator combines 7 signals: stock price momentum (S&P vs 125-day average), "
+            'stock price strength (52W highs vs lows on NYSE), stock price breadth (advancing vs declining volume), '
+            'put and call options ratio, junk bond demand (yield spread), market volatility (VIX), and safe haven demand (stocks vs bonds). '
+            'Readings below 25 = Extreme Fear (historically good buying zones). Above 75 = Extreme Greed (historically time to be cautious).'
+            '</div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
     # ── Volatility Regime ─────────────────────────────────────────────────────
     st.markdown("### ⚡ Volatility Regime")
+    st.caption("VIX = the market's speedometer for fear. It measures how much movement options traders expect in the S&P 500 over the next 30 days.")
+
     vix_data  = macro.get("VIX", {})
     vvix_data = macro.get("VVIX", {})
     v3m_data  = macro.get("VIX3M", {})
@@ -2200,7 +2314,7 @@ if page == "🌍 Macro Dashboard":
             term_struct = vix_data["price"] - v3m_data["price"]
             ts_c = "#ff5252" if term_struct > 0 else "#00e676"
             ts_label = "BACKWARDATION ⚠️" if term_struct > 0 else "CONTANGO ✓"
-            ts_desc  = "Near-term fear > future → caution" if term_struct > 0 else "Calm near-term, normal structure"
+            ts_desc  = "Near-term fear > future fear — acute stress event" if term_struct > 0 else "Near-term calm — normal healthy structure"
             vc2.markdown(
                 f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {ts_c}">'
                 f'<div style="font-size:10px;color:#555">VIX TERM STRUCTURE</div>'
@@ -2227,10 +2341,69 @@ if page == "🌍 Macro Dashboard":
             f'<div style="font-size:10px;color:#555">{"Rising fear" if vix_data["ret_1w"] > 0 else "Easing fear"}</div>'
             f'</div>', unsafe_allow_html=True)
 
+        # VIX plain language
+        vix_explanations = {
+            (0, 15):   ("🟢", "#00e676", f"VIX at {vix_val:.1f} — Markets are calm. Options are cheap. This is the environment where momentum strategies work best and buying dips is rewarded. The risk here is complacency — low VIX often precedes spikes."),
+            (15, 20):  ("🟡", "#69f0ae", f"VIX at {vix_val:.1f} — Normal market conditions. Nothing to worry about but nothing to be euphoric about either. Continue your normal strategy."),
+            (20, 25):  ("⚠️", "#ffd740", f"VIX at {vix_val:.1f} — Volatility is elevated. Markets are nervous about something. Size down new positions, tighten stop losses, avoid leveraged bets."),
+            (25, 35):  ("🚨", "#ff5252", f"VIX at {vix_val:.1f} — High fear. This is where most retail investors panic and sell at the bottom. Historically, buying quality assets when VIX is above 30 has been very profitable — but you need conviction and a multi-week horizon."),
+            (35, 999): ("🔴", "#ff1744", f"VIX at {vix_val:.1f} — Extreme fear / capitulation. The market is pricing in a crisis. These are historically the best buying opportunities of a generation — but only for those with cash ready and nerves of steel."),
+        }
+        for (lo, hi), (icon, color, text) in vix_explanations.items():
+            if lo <= vix_val < hi:
+                st.markdown(
+                    f'<div style="background:#1c1f26;border-left:4px solid {color};border-radius:0 10px 10px 0;'
+                    f'padding:12px 16px;margin-top:10px;font-size:13px;color:#aaa">{icon} {text}</div>',
+                    unsafe_allow_html=True)
+                break
+
+        # VIX Term Structure explanation
+        if v3m_data:
+            term_struct = vix_data["price"] - v3m_data["price"]
+            if term_struct > 2:
+                st.markdown(
+                    '<div style="background:#1c1f26;border-left:4px solid #ff5252;border-radius:0 10px 10px 0;'
+                    'padding:10px 14px;margin-top:6px;font-size:12px;color:#aaa">'
+                    '⚠️ <b style="color:#ff5252">VIX Backwardation</b> — Near-term VIX is higher than 3-month VIX. '
+                    'This means traders are more scared about the next 30 days than the next 90 days — a specific, acute fear rather than chronic worry. '
+                    'These situations tend to resolve quickly. Once the near-term event passes, VIX often drops sharply, '
+                    'which is actually a tailwind for stocks. Watch for the catalyst (earnings, Fed meeting, geopolitical event) and the resolution.'
+                    '</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    '<div style="background:#1c1f26;border-left:4px solid #00e676;border-radius:0 10px 10px 0;'
+                    'padding:10px 14px;margin-top:6px;font-size:12px;color:#aaa">'
+                    '✅ <b style="color:#00e676">VIX Contango</b> — The normal healthy state. 3-month VIX is higher than near-term VIX, '
+                    'meaning traders expect more volatility in the future than right now. '
+                    'This is the natural structure of the options market when there is no immediate crisis. '
+                    'Think of it like car insurance being cheaper when roads are dry.'
+                    '</div>', unsafe_allow_html=True)
+
+        # VVIX explanation
+        if vvix_data:
+            vvix_val = vvix_data["price"]
+            vvix_explain_c = "#ff5252" if vvix_val > 120 else ("#ffd740" if vvix_val > 100 else "#00e676")
+            vvix_text = (
+                f"VVIX at {vvix_val:.0f} — **Very elevated**. The market is not just fearful, it's uncertain about *how fearful to be*. "
+                "This is the most dangerous macro environment — volatility of volatility spikes precede the biggest market dislocations. Reduce risk."
+                if vvix_val > 120 else
+                f"VVIX at {vvix_val:.0f} — **Moderately elevated**. Some nervousness about future volatility. "
+                "Not a crisis signal but worth watching. If VVIX keeps climbing while VIX is still low, that's an early warning."
+                if vvix_val > 100 else
+                f"VVIX at {vvix_val:.0f} — **Normal**. The volatility market itself is calm. "
+                "When even the fear-of-fear gauge is relaxed, the macro backdrop is genuinely benign."
+            )
+            st.markdown(
+                f'<div style="background:#1c1f26;border-left:4px solid {vvix_explain_c};border-radius:0 10px 10px 0;'
+                f'padding:10px 14px;margin-top:6px;font-size:12px;color:#aaa">'
+                f'📊 {vvix_text}</div>', unsafe_allow_html=True)
+
     st.markdown("---")
 
-    # ── Yield Curve ───────────────────────────────────────────────────────────
+    # ── Yield Curve & Credit ──────────────────────────────────────────────────
     st.markdown("### 📈 Yield Curve & Credit")
+    st.caption("The yield curve is the single most reliable recession predictor in financial history. Credit spreads tell you how confident the bond market is in corporate health.")
+
     y10 = macro.get("10Y Yield", {})
     y2  = macro.get("2Y Yield", {})
     y30 = macro.get("30Y Yield", {})
@@ -2260,22 +2433,89 @@ if page == "🌍 Macro Dashboard":
                 f'<div style="font-size:11px;color:{c}">1W: {data["ret_1w"]:+.2f}%</div>'
                 f'</div>', unsafe_allow_html=True)
 
-    # Credit spread proxy
+    # Yield curve plain language
+    if y10 and y2:
+        spread = y10["price"] - y2["price"]
+        if spread < 0:
+            yc_text = (
+                f"🚨 **Inverted yield curve** ({spread:+.2f}%) — Short-term rates are HIGHER than long-term rates. "
+                "This is abnormal and historically has predicted every US recession since 1955, typically with a 12-24 month lag. "
+                "What it means: banks borrow short-term and lend long-term — when this spread is negative, their margins are crushed and they stop lending, "
+                "which slows the economy. **For your portfolio:** reduce cyclical exposure, favour defensive sectors (utilities, staples, healthcare), hold more cash."
+            )
+            yc_c = "#ff5252"
+        elif spread < 0.3:
+            yc_text = (
+                f"⚠️ **Flat yield curve** ({spread:+.2f}%) — The spread between short and long rates is very thin. "
+                "Not yet inverted but moving in a concerning direction. Banks are seeing compressed margins. "
+                "Growth is likely to slow. Watch whether this flattens further or starts to steepen. "
+                "**For your portfolio:** don't panic but start trimming the most speculative positions."
+            )
+            yc_c = "#ffd740"
+        else:
+            yc_text = (
+                f"✅ **Normal yield curve** ({spread:+.2f}%) — Long-term rates are meaningfully higher than short-term. "
+                "This is the healthy state. Banks can borrow cheaply short-term and lend at higher long-term rates, "
+                "which incentivises lending and economic activity. "
+                "**For your portfolio:** macro backdrop is supportive. Focus on stock-picking rather than macro hedging."
+            )
+            yc_c = "#00e676"
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {yc_c};border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-top:10px;font-size:13px;color:#aaa">{yc_text}</div>',
+            unsafe_allow_html=True)
+
+    # Rates direction explanation
+    if y10:
+        rate_dir = y10["ret_1w"]
+        if abs(rate_dir) > 0.2:
+            rate_dir_c = "#ff5252" if rate_dir > 0 else "#00e676"
+            rate_dir_text = (
+                f"📉 **Rates rising** (+{rate_dir:.2f}% this week) — Higher rates are generally bad for growth stocks and real estate "
+                "(their future cash flows get discounted more heavily), and bad for bonds. They're good for banks and value stocks. "
+                "Your AI/tech positions are most rate-sensitive — a rate spike is often what triggers a tech selloff."
+                if rate_dir > 0 else
+                f"📈 **Rates falling** ({rate_dir:.2f}% this week) — Lower rates are good for growth stocks, real estate, and bonds. "
+                "They reduce the discount rate applied to future earnings, making high-multiple stocks more attractive. "
+                "This is a tailwind for your AI/tech and speculative positions."
+            )
+            st.markdown(
+                f'<div style="background:#1c1f26;border-left:4px solid {rate_dir_c};border-radius:0 10px 10px 0;'
+                f'padding:10px 14px;margin-top:6px;font-size:12px;color:#aaa">{rate_dir_text}</div>',
+                unsafe_allow_html=True)
+
+    # Credit spread
     if hyg and iei:
-        st.markdown("---")
         credit_ratio = hyg["ret_1m"] - iei["ret_1m"]
         credit_c = "#00e676" if credit_ratio > 0 else "#ff5252"
         credit_label = "Risk-On — junk outperforming" if credit_ratio > 0 else "Risk-Off — flight to quality"
         st.markdown(
-            f'<div style="background:#1c1f26;border-radius:8px;padding:10px 16px;border-left:4px solid {credit_c};font-size:13px">'
+            f'<div style="background:#1c1f26;border-radius:8px;padding:10px 16px;border-left:4px solid {credit_c};font-size:13px;margin-top:8px">'
             f'<b style="color:{credit_c}">Credit Spread Signal:</b> '
             f'<span style="color:#aaa">HYG vs IEI 1M: <b style="color:{credit_c}">{credit_ratio:+.2f}%</b> — {credit_label}</span>'
             f'</div>', unsafe_allow_html=True)
+
+        credit_text = (
+            "✅ **Junk bonds outperforming investment grade** — This is a risk-on signal from the credit market. "
+            "When investors are willing to hold lower-quality debt (junk) over safer debt (investment grade), "
+            "it means confidence in corporate health is high. Credit markets are often smarter than equity markets "
+            "— they tend to crack before stocks do. When this flips, pay attention."
+            if credit_ratio > 0 else
+            "⚠️ **Flight to quality in credit** — Investment grade outperforming junk bonds means credit investors are nervous. "
+            "They're accepting lower yields in exchange for safety. This is an early warning signal that often precedes "
+            "equity market weakness by 2-4 weeks. Watch whether this trend continues."
+        )
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {credit_c};border-radius:0 10px 10px 0;'
+            f'padding:10px 14px;margin-top:4px;font-size:12px;color:#aaa">{credit_text}</div>',
+            unsafe_allow_html=True)
 
     st.markdown("---")
 
     # ── Dollar & FX ───────────────────────────────────────────────────────────
     st.markdown("### 💵 Dollar & FX")
+    st.caption("The dollar is the world's reserve currency — its direction affects almost every asset class.")
+
     fx_names = ["DXY (USD)", "USD/CAD", "EUR/USD"]
     fx_cols  = st.columns(len(fx_names))
     for i, name in enumerate(fx_names):
@@ -2283,7 +2523,6 @@ if page == "🌍 Macro Dashboard":
         if not data:
             continue
         c1m = "#ff5252" if data["ret_1m"] > 0 else "#00e676"
-        # For DXY: rising dollar = risk-off signal
         if "DXY" in name:
             dxy_regime = "Strong USD — headwind for commodities & EM" if data["ret_1m"] > 2 else (
                 "Weak USD — tailwind for gold, EM, commodities" if data["ret_1m"] < -2 else "USD Neutral")
@@ -2302,10 +2541,62 @@ if page == "🌍 Macro Dashboard":
                 f'<div style="font-size:11px;color:{c1m}">1M: {data["ret_1m"]:+.2f}%</div>'
                 f'</div>', unsafe_allow_html=True)
 
+    # DXY plain language
+    dxy = macro.get("DXY (USD)", {})
+    usdcad = macro.get("USD/CAD", {})
+    if dxy:
+        dxy_1m = dxy["ret_1m"]
+        if dxy_1m > 2:
+            dxy_text = (
+                f"🔴 **Strong dollar (+{dxy_1m:.1f}% 1M)** — A rising dollar is a headwind for several of your holdings. "
+                "Commodities (gold, copper, oil) are priced in dollars — when the dollar rises, these fall in relative terms. "
+                "Emerging market stocks (VEE.TO, VNM) face double pressure: their local currencies weaken AND foreign investors pull out. "
+                "Multinational companies earn less when converting overseas profits back to dollars. "
+                "Your gold position (WPM.TO) is most directly impacted."
+            )
+            dxy_c = "#ff5252"
+        elif dxy_1m < -2:
+            dxy_text = (
+                f"🟢 **Weak dollar ({dxy_1m:.1f}% 1M)** — A falling dollar is a tailwind across multiple asset classes. "
+                "Gold typically rises when the dollar falls. Emerging markets get a boost. "
+                "Your WPM.TO, COPP.TO, and emerging market ETFs (VEE.TO, VNM) should benefit. "
+                "This also supports commodity prices broadly — bullish for your energy and materials positions."
+            )
+            dxy_c = "#00e676"
+        else:
+            dxy_text = (
+                f"➖ **Dollar neutral ({dxy_1m:+.1f}% 1M)** — No strong dollar headwind or tailwind. "
+                "FX is not a major factor in your returns right now — focus on fundamentals and technicals."
+            )
+            dxy_c = "#888"
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {dxy_c};border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-top:10px;font-size:13px;color:#aaa">{dxy_text}</div>',
+            unsafe_allow_html=True)
+
+    # USD/CAD specific for Fabien
+    if usdcad:
+        cad_val = usdcad["price"]
+        cad_1m  = usdcad["ret_1m"]
+        # Note: CADUSD=X shows CAD per USD (inverse), so higher = stronger USD vs CAD
+        cad_text = (
+            f"🍁 **USD/CAD note** — The CAD is at {cad_val:.4f} USD (1M: {cad_1m:+.2f}%). "
+            + ("Your TSX holdings (ENB.TO, WPM.TO, etc.) earn in CAD — a stronger CAD vs USD means your CAD assets are worth more in USD terms, but your US holdings are worth slightly less in CAD. "
+               "Oil prices also matter for CAD — Canada is a commodity currency, so oil strength typically strengthens CAD."
+               if abs(cad_1m) > 1 else
+               "CAD is relatively stable vs USD this month — minimal FX impact on your cross-border holdings.")
+        )
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid #ff0000;border-radius:0 10px 10px 0;'
+            f'padding:10px 14px;margin-top:6px;font-size:12px;color:#aaa">{cad_text}</div>',
+            unsafe_allow_html=True)
+
     st.markdown("---")
 
     # ── Commodities ───────────────────────────────────────────────────────────
     st.markdown("### 🥇 Commodities & Risk Appetite")
+    st.caption("Commodities reflect real-world supply/demand and act as inflation and growth barometers. Bitcoin is the speculative risk appetite gauge.")
+
     comm_names = ["Gold", "Oil (WTI)", "Copper", "Silver", "Bitcoin"]
     comm_cols  = st.columns(len(comm_names))
     for i, name in enumerate(comm_names):
@@ -2321,56 +2612,95 @@ if page == "🌍 Macro Dashboard":
             f'<div style="font-size:11px;color:{c}">1M: {data["ret_1m"]:+.2f}%</div>'
             f'</div>', unsafe_allow_html=True)
 
-    # Gold/Oil ratio
+    # Commodities plain language
     gold = macro.get("Gold", {})
     oil  = macro.get("Oil (WTI)", {})
+    copper = macro.get("Copper", {})
+    btc  = macro.get("Bitcoin", {})
+
+    comm_interpretations = []
+
+    if gold:
+        g1m = gold["ret_1m"]
+        if g1m > 5:
+            comm_interpretations.append(("#ffd740", f"🥇 **Gold surging (+{g1m:.1f}% 1M)** — Strong gold is a defensive signal. Investors are seeking safety. This often accompanies dollar weakness, geopolitical stress, or inflation concerns. Your WPM.TO (gold streaming) is directly benefiting. Watch if this is driven by inflation fears (bullish for WPM long-term) or pure fear (temporary safe-haven bid)."))
+        elif g1m < -5:
+            comm_interpretations.append(("#ff5252", f"🥇 **Gold declining ({g1m:.1f}% 1M)** — Weak gold suggests risk-on rotation (investors prefer equities over safe havens) or dollar strength. Headwind for your WPM.TO position. Not alarming unless it accelerates."))
+
+    if copper:
+        cu1m = copper["ret_1m"]
+        if cu1m > 5:
+            comm_interpretations.append(("#00e676", f"🔴 **Copper strong (+{cu1m:.1f}% 1M)** — Copper is called 'Dr. Copper' because it has a PhD in economics. Strong copper means global industrial demand is healthy — factories are running, construction is active. Bullish macro signal. Your COPP.TO benefits directly."))
+        elif cu1m < -5:
+            comm_interpretations.append(("#ff5252", f"🔴 **Copper weak ({cu1m:.1f}% 1M)** — Falling copper often signals slowing global growth, particularly in China (world's largest copper consumer). This is a macro warning worth taking seriously. Headwind for COPP.TO."))
+
+    if btc:
+        b1m = btc["ret_1m"]
+        if b1m > 20:
+            comm_interpretations.append(("#F7931A", f"₿ **Bitcoin surging (+{b1m:.1f}% 1M)** — Strong BTC signals broad risk appetite in speculative assets. When crypto runs, it often pulls your smaller speculative positions (SOUN, LUNR, RDW, quantum plays) along with it. Risk-on environment."))
+        elif b1m < -20:
+            comm_interpretations.append(("#ff5252", f"₿ **Bitcoin weak ({b1m:.1f}% 1M)** — BTC selling off is often a leading indicator of risk-off sentiment spreading to equities. Your speculative positions are most vulnerable. Consider trimming exposure."))
+
     if gold and oil and oil["price"] > 0:
         go_ratio = gold["price"] / oil["price"]
         go_c = "#ffd740" if go_ratio > 25 else "#00e676"
-        go_label = "Defensive — gold expensive vs oil, risk-off signal" if go_ratio > 25 else "Growth — oil strong vs gold, risk-on"
+        go_label = "Defensive" if go_ratio > 25 else "Growth"
         st.markdown(
             f'<div style="background:#1c1f26;border-radius:8px;padding:10px 16px;border-left:4px solid {go_c};font-size:13px;margin-top:8px">'
-            f'<b style="color:{go_c}">Gold/Oil Ratio:</b> '
-            f'<span style="color:#aaa"><b style="color:#ddd">{go_ratio:.1f}x</b> — {go_label}</span>'
-            f'</div>', unsafe_allow_html=True)
+            f'<b style="color:{go_c}">Gold/Oil Ratio: {go_ratio:.1f}x</b> — '
+            f'<span style="color:#aaa">{go_label} signal. '
+            + (f"High ratio means gold is expensive relative to oil — investors prefer safety over growth. Defensive positioning recommended."
+               if go_ratio > 25 else
+               f"Low ratio means oil is strong relative to gold — industrial demand is driving markets, not fear. Risk-on environment, cyclicals favoured.")
+            + '</span></div>', unsafe_allow_html=True)
+
+    for color, text in comm_interpretations:
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {color};border-radius:0 10px 10px 0;'
+            f'padding:10px 14px;margin-top:6px;font-size:12px;color:#aaa">{text}</div>',
+            unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Macro Summary ─────────────────────────────────────────────────────────
+    # ── Macro Regime Summary ──────────────────────────────────────────────────
     st.markdown("### 🧭 Macro Regime Summary")
+    st.caption("Synthesising all signals into actionable context for your portfolio.")
 
-    # Build regime signals
     signals = []
     if vix_data:
         vix_v = vix_data["price"]
         if vix_v < 18:
-            signals.append(("✅", "Low VIX", f"{vix_v:.1f} — Market calm, risk-on environment", "#00e676"))
+            signals.append(("✅", "Low VIX", f"{vix_v:.1f} — Market calm, risk-on environment. Momentum strategies work. Options cheap for protection.", "#00e676"))
         elif vix_v > 25:
-            signals.append(("🚨", "High VIX", f"{vix_v:.1f} — Elevated fear, de-risk or wait", "#ff5252"))
+            signals.append(("🚨", "High VIX", f"{vix_v:.1f} — Elevated fear. Size down, wait for stabilisation before adding positions.", "#ff5252"))
         else:
-            signals.append(("⚠️", "Moderate VIX", f"{vix_v:.1f} — Cautious positioning warranted", "#ffd740"))
+            signals.append(("⚠️", "Moderate VIX", f"{vix_v:.1f} — Cautious positioning. Normal volatility but watch for spikes.", "#ffd740"))
 
     if y10 and y2:
         spread = y10["price"] - y2["price"]
         if spread < 0:
-            signals.append(("🚨", "Inverted Yield Curve", f"Spread {spread:+.2f}% — Recession warning", "#ff5252"))
+            signals.append(("🚨", "Inverted Yield Curve", f"Spread {spread:+.2f}% — Recession signal. Historically reliable. Shift toward defensives and cash.", "#ff5252"))
         elif spread < 0.3:
-            signals.append(("⚠️", "Flat Yield Curve", f"Spread {spread:+.2f}% — Growth concern", "#ffd740"))
+            signals.append(("⚠️", "Flat Yield Curve", f"Spread {spread:+.2f}% — Growth slowing. Reduce cyclical exposure, avoid deep value traps.", "#ffd740"))
         else:
-            signals.append(("✅", "Normal Yield Curve", f"Spread {spread:+.2f}% — Healthy structure", "#00e676"))
+            signals.append(("✅", "Normal Yield Curve", f"Spread {spread:+.2f}% — Healthy credit environment. Banks lending. Economic expansion supported.", "#00e676"))
 
     if fg["available"]:
         if fg["score"] > 75:
-            signals.append(("⚠️", "Extreme Greed", f"F&G {fg['score']:.0f} — Contrarian caution, market may be frothy", "#ff6b35"))
+            signals.append(("⚠️", "Extreme Greed", f"F&G {fg['score']:.0f} — Crowded trade. Trim winners, raise cash. Not a sell signal — a caution signal.", "#ff6b35"))
         elif fg["score"] < 25:
-            signals.append(("✅", "Extreme Fear", f"F&G {fg['score']:.0f} — Historically good entry zone", "#00e676"))
+            signals.append(("✅", "Extreme Fear", f"F&G {fg['score']:.0f} — Historically a buying zone. Deploy cash into quality names systematically.", "#00e676"))
 
-    btc = macro.get("Bitcoin", {})
     if btc:
         if btc["ret_1m"] > 15:
-            signals.append(("✅", "BTC Risk Appetite", f"+{btc['ret_1m']:.1f}% 1M — Speculative appetite strong", "#F7931A"))
+            signals.append(("✅", "BTC Risk Appetite", f"+{btc['ret_1m']:.1f}% 1M — Speculative appetite strong. Tailwind for your growth and speculative positions.", "#F7931A"))
         elif btc["ret_1m"] < -15:
-            signals.append(("🚨", "BTC Weakness", f"{btc['ret_1m']:.1f}% 1M — Risk appetite fading", "#ff5252"))
+            signals.append(("🚨", "BTC Weakness", f"{btc['ret_1m']:.1f}% 1M — Risk appetite fading. Review speculative positions.", "#ff5252"))
+
+    if hyg and iei:
+        credit_ratio = hyg["ret_1m"] - iei["ret_1m"]
+        if credit_ratio < -1:
+            signals.append(("⚠️", "Credit Stress", f"Junk bonds lagging by {abs(credit_ratio):.1f}% — bond market seeing stress before equity market. Watch closely.", "#ffd740"))
 
     for icon, title, desc, color in signals:
         st.markdown(
@@ -2380,6 +2710,28 @@ if page == "🌍 Macro Dashboard":
             f'<b style="color:{color}">{title}</b> '
             f'<span style="color:#888;font-size:12px">— {desc}</span>'
             f'</div>', unsafe_allow_html=True)
+
+    # Overall portfolio posture recommendation
+    bullish_signals = sum(1 for _, _, _, c in signals if c in ("#00e676", "#F7931A", "#69f0ae"))
+    bearish_signals = sum(1 for _, _, _, c in signals if c in ("#ff5252", "#ff1744"))
+    caution_signals = sum(1 for _, _, _, c in signals if c in ("#ffd740", "#ff6b35"))
+
+    if bullish_signals >= 3 and bearish_signals == 0:
+        posture_c, posture = "#00e676", "🟢 RISK-ON — Macro backdrop supports aggressive positioning. Run your winners, add to high-conviction ideas."
+    elif bearish_signals >= 2:
+        posture_c, posture = "#ff5252", "🔴 RISK-OFF — Multiple macro warning signs. Reduce position sizes, raise cash, prioritise capital preservation."
+    elif caution_signals >= 2:
+        posture_c, posture = "#ffd740", "🟡 CAUTIOUS — Mixed signals. Hold existing positions but be selective about new entries. Size smaller than normal."
+    else:
+        posture_c, posture = "#888", "⬜ NEUTRAL — No dominant macro signal. Let technicals and fundamentals drive individual stock decisions."
+
+    st.markdown(
+        f'<div style="background:#1c1f26;border-radius:12px;padding:16px;margin-top:12px;'
+        f'border:2px solid {posture_c};text-align:center">'
+        f'<div style="font-size:11px;color:#555;text-transform:uppercase;margin-bottom:6px">Suggested Portfolio Posture</div>'
+        f'<div style="font-size:14px;font-weight:700;color:{posture_c}">{posture}</div>'
+        f'</div>', unsafe_allow_html=True)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2443,11 +2795,25 @@ elif page == "🔄 Sector Rotation (RRG)":
     # ── RRG Plot ──────────────────────────────────────────────────────────────
     fig = go.Figure()
 
-    # Quadrant background shading
+    # Quadrant background shading — smart scaling to prevent clustering
     x_mid = 100
     y_mid = 0
-    x_range = [rrg_df["RS_Value"].min() - 2, rrg_df["RS_Value"].max() + 2]
-    y_range = [rrg_df["RS_Momentum"].min() - 1, rrg_df["RS_Momentum"].max() + 1]
+
+    # X-axis: centre on 100, symmetric padding based on spread
+    x_vals   = rrg_df["RS_Value"].values
+    x_spread = max(float(x_vals.max() - x_vals.min()), 4.0)
+    x_pad    = max(x_spread * 0.35, 3.0)
+    x_centre = float(x_vals.mean())
+    # Always keep 100 (neutral line) visible and roughly centred
+    x_lo = min(x_centre - x_pad, 100 - x_pad * 0.5)
+    x_hi = max(x_centre + x_pad, 100 + x_pad * 0.5)
+    x_range = [round(x_lo, 1), round(x_hi, 1)]
+
+    # Y-axis: symmetric around 0
+    y_vals   = rrg_df["RS_Momentum"].values
+    y_max    = max(abs(float(y_vals.max())), abs(float(y_vals.min())), 1.5)
+    y_pad    = y_max * 0.4
+    y_range  = [-(y_max + y_pad), (y_max + y_pad)]
 
     # Shaded quadrant regions
     for x0, x1, y0, y1, color, label in [
@@ -2473,17 +2839,22 @@ elif page == "🔄 Sector Rotation (RRG)":
     fig.add_hline(y=0,   line_dash="dash", line_color="#444", line_width=1)
     fig.add_vline(x=100, line_dash="dash", line_color="#444", line_width=1)
 
-    # Tail lines (RS trajectory)
+    # Tail lines — show 4-week RS trajectory as arrow
     for _, row in rrg_df.iterrows():
-        rs_data_sector = rs_data.get(row["Sector"], {})
-        rs4w = rs_data_sector.get("rs_4w", row["RS_Value"])
+        sd     = rs_data.get(row["Sector"], {})
+        rs4w   = sd.get("rs_4w",  row["RS_Value"])
+        rs8w   = sd.get("rs_8w",  rs4w)
+        # Estimate momentum 4 weeks ago using rs_4w as reference point
+        mom4w  = (rs4w / sd.get("rs_12w", rs4w) - 1) * 100 if sd.get("rs_12w", 0) > 0 else 0
+        # Draw multi-point tail: 8w ago → 4w ago → now
         fig.add_trace(go.Scatter(
-            x=[rs4w, row["RS_Value"]],
-            y=[0, row["RS_Momentum"]],
+            x=[rs8w, rs4w, row["RS_Value"]],
+            y=[mom4w * 0.3, mom4w * 0.7, row["RS_Momentum"]],
             mode="lines",
-            line=dict(color=row["Color"], width=1.5, dash="dot"),
+            line=dict(color=row["Color"], width=2, dash="dot"),
             showlegend=False,
             hoverinfo="skip",
+            opacity=0.6,
         ))
 
     # Sector bubbles
@@ -2561,6 +2932,69 @@ elif page == "🔄 Sector Rotation (RRG)":
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.caption("RS Value > 100 = outperforming S&P 500 · RS Momentum positive = improving relative strength · Dotted tails show 4-week trajectory")
+
+    st.markdown("---")
+    st.markdown("### 🧭 What the RRG Is Telling You")
+
+    # Build action insights per quadrant
+    leading    = rrg_df[rrg_df["Quadrant"] == "🟢 Leading"]
+    weakening  = rrg_df[rrg_df["Quadrant"] == "🔵 Weakening"]
+    recovering = rrg_df[rrg_df["Quadrant"] == "🟡 Recovering"]
+    lagging    = rrg_df[rrg_df["Quadrant"] == "🔴 Lagging"]
+
+    if not leading.empty:
+        names = ", ".join(f"{r['ETF']} ({r['Sector'][:12]})" for _, r in leading.iterrows())
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid #00e676;border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-bottom:8px">'
+            f'<b style="color:#00e676">🟢 LEADING — {names}</b><br>'
+            f'<span style="color:#aaa;font-size:12px">These sectors are beating the S&P 500 AND their relative strength is still improving. '
+            f'This is where you want to be overweight. If you have holdings in these sectors, this confirms your positioning. '
+            f'Stocks within leading sectors tend to outperform even if the broader market stumbles.</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    if not weakening.empty:
+        names = ", ".join(f"{r['ETF']} ({r['Sector'][:12]})" for _, r in weakening.iterrows())
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid #5c7cfa;border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-bottom:8px">'
+            f'<b style="color:#5c7cfa">🔵 WEAKENING — {names}</b><br>'
+            f'<span style="color:#aaa;font-size:12px">These sectors were strong but are losing momentum. Still outperforming the S&P 500 overall, '
+            f'but the tide is turning. Review your positions here — not a panic sell, but worth trimming winners and tightening stops. '
+            f'They often rotate into Lagging next unless a catalyst reverses the trend.</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    if not recovering.empty:
+        names = ", ".join(f"{r['ETF']} ({r['Sector'][:12]})" for _, r in recovering.iterrows())
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid #ffd740;border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-bottom:8px">'
+            f'<b style="color:#ffd740">🟡 RECOVERING — {names}</b><br>'
+            f'<span style="color:#aaa;font-size:12px">These sectors have been underperforming but their relative strength is now improving. '
+            f'This is the early entry signal — the contrarian opportunity. They are still below neutral but the direction has changed. '
+            f'Best used in combination with a macro tailwind (e.g. energy recovering + oil rising = conviction).</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    if not lagging.empty:
+        names = ", ".join(f"{r['ETF']} ({r['Sector'][:12]})" for _, r in lagging.iterrows())
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid #ff5252;border-radius:0 10px 10px 0;'
+            f'padding:12px 16px;margin-bottom:8px">'
+            f'<b style="color:#ff5252">🔴 LAGGING — {names}</b><br>'
+            f'<span style="color:#aaa;font-size:12px">These sectors are underperforming and still deteriorating. Avoid adding new positions here. '
+            f'If you hold stocks in these sectors, review whether your thesis is still intact or whether the sector headwind is too strong. '
+            f'Lagging sectors can stay lagging for months.</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    # Rotation cycle note
+    st.markdown(
+        '<div style="background:#1c1f26;border-radius:8px;padding:12px 16px;margin-top:8px;'
+        'border:1px solid #2d3139;font-size:12px;color:#888">'
+        '💡 <b style="color:#ddd">Typical rotation cycle:</b> Sectors generally rotate clockwise — '
+        'Recovering → Leading → Weakening → Lagging → Recovering. '
+        'The fastest money is made catching a sector moving from Recovering into Leading. '
+        'The tail direction tells you which way it is heading -- look for tails pointing toward the Leading quadrant.'
+        '</div>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3023,3 +3457,811 @@ elif page == "📰 AI News Sentiment":
 - Identifies **sector-level catalysts** you might have missed
 - Updates every **30 minutes** (cached)
         """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTION D: ACCURACY UPGRADES — Relative Strength per stock + Volume confirm
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=900)
+def fetch_stock_momentum_enhanced(tickers: list, sector_etf: str = "SPY") -> dict:
+    """
+    Enhanced momentum with:
+    - Relative Strength vs sector ETF (not just absolute)
+    - Volume confirmation flag
+    - Insider buy/sell proxy via short interest change
+    """
+    results = {}
+
+    # Fetch benchmark
+    try:
+        bench_hist = yf.Ticker(sector_etf).history(period="6mo", interval="1d")
+        bench_close = bench_hist["Close"].squeeze() if not bench_hist.empty else None
+    except Exception:
+        bench_close = None
+
+    for ticker in tickers:
+        try:
+            t    = yf.Ticker(ticker)
+            hist = t.history(period="6mo", interval="1d")
+            if hist.empty or len(hist) < 20:
+                continue
+
+            close = hist["Close"].squeeze()
+            vol   = hist["Volume"].squeeze() if "Volume" in hist.columns else None
+
+            # Base momentum score
+            mom = compute_momentum_score(hist)
+            score = mom["score"]
+            details = mom["details"].copy()
+
+            # Relative Strength vs benchmark
+            if bench_close is not None:
+                try:
+                    combined = pd.concat([close, bench_close], axis=1).dropna()
+                    combined.columns = ["stock", "bench"]
+                    if len(combined) >= 20:
+                        rs_ratio = combined["stock"] / combined["bench"]
+                        rs_1m = (float(rs_ratio.iloc[-1]) / float(rs_ratio.iloc[-22]) - 1) * 100 if len(rs_ratio) >= 22 else 0
+                        rs_3m = (float(rs_ratio.iloc[-1]) / float(rs_ratio.iloc[-63]) - 1) * 100 if len(rs_ratio) >= 63 else 0
+                        details["rs_vs_bench_1m"] = round(rs_1m, 1)
+                        details["rs_vs_bench_3m"] = round(rs_3m, 1)
+                        # Bonus points for relative outperformance
+                        if rs_1m > 5:   score = min(score + 10, 100)
+                        elif rs_1m > 0: score = min(score + 5, 100)
+                        elif rs_1m < -5: score = max(score - 10, 0)
+                except Exception:
+                    pass
+
+            # Volume confirmation
+            if vol is not None and len(vol) >= 20:
+                avg_vol   = float(vol.rolling(20).mean().iloc[-1])
+                last_vol  = float(vol.iloc[-1])
+                vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
+                details["vol_ratio"] = round(vol_ratio, 2)
+                # Price + high volume = confirmed move
+                ret_1d = details.get("ret_1d", 0)
+                if ret_1d > 1 and vol_ratio > 1.5:
+                    details["vol_confirmed"] = True
+                    score = min(score + 8, 100)
+                elif ret_1d < -1 and vol_ratio > 1.5:
+                    details["vol_confirmed_down"] = True
+                    score = max(score - 8, 0)
+                else:
+                    details["vol_confirmed"] = False
+
+            # Try insider/short interest proxy
+            try:
+                info = t.info or {}
+                short_pct = info.get("shortPercentOfFloat", 0) or 0
+                details["short_pct"] = round(float(short_pct) * 100, 1)
+                # High short interest can mean squeeze potential OR warning
+                if short_pct > 0.20:
+                    details["short_squeeze_risk"] = True
+            except Exception:
+                pass
+
+            results[ticker] = {
+                "score":   min(score, 100),
+                "grade":   mom["grade"],
+                "details": details,
+                "name":    ticker,
+                "you_own": any(ticker.startswith(p) for p in YOUR_PORTFOLIO),
+            }
+        except Exception:
+            continue
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTION C: STOCK SCREENER DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+SCREENER_UNIVERSE = list(set(
+    SECTOR_STOCKS["Technology"] + SECTOR_STOCKS["Healthcare"] +
+    SECTOR_STOCKS["Financials"] + SECTOR_STOCKS["Consumer Discretionary"] +
+    SECTOR_STOCKS["Industrials"] + SECTOR_STOCKS["Communication Services"] +
+    SECTOR_STOCKS["Energy"] + SECTOR_STOCKS["Consumer Staples"] +
+    SECTOR_STOCKS["Materials"] + SECTOR_STOCKS["Utilities"] +
+    SECTOR_STOCKS["Real Estate"] +
+    # Add your portfolio tickers
+    ["NVDA","MSFT","AMZN","META","TSLA","AAPL","CRWV","APLD","SOUN","LUNR",
+     "BBAI","NNE","OKLO","QBTS","RGTI","WPM","ENB","BEP-UN","RDDT","NU"]
+))
+
+
+@st.cache_data(ttl=1800)
+def run_stock_screener(
+    min_momentum: int = 60,
+    sectors: list = None,
+    volume_confirmed: bool = False,
+    rs_positive: bool = False,
+) -> pd.DataFrame:
+    """Screen stocks by momentum, RS, volume confirmation."""
+    raw = fetch_stock_momentum(SCREENER_UNIVERSE)
+    rows = []
+    for ticker, data in raw.items():
+        d = data.get("details", {})
+        sec = data.get("sector", "")
+
+        if sectors and sec and sec not in sectors:
+            continue
+        if data["score"] < min_momentum:
+            continue
+        if volume_confirmed and not d.get("vol_confirmed", False):
+            continue
+        if rs_positive and d.get("rs_vs_bench_1m", 0) <= 0:
+            continue
+
+        rows.append({
+            "Ticker":    ticker,
+            "Score":     data["score"],
+            "Grade":     data["grade"],
+            "1D%":       d.get("ret_1d", 0),
+            "1W%":       d.get("ret_1w", 0),
+            "1M%":       d.get("ret_1m", 0),
+            "RSI":       d.get("rsi", 50),
+            "vs SMA50":  d.get("vs_sma50", 0),
+            "Vol Ratio": d.get("vol_ratio", 1.0),
+            "RS 1M":     d.get("rs_vs_bench_1m", 0),
+            "Own":       "✓" if data.get("you_own") else "",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("Score", ascending=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTION C: ECONOMIC CALENDAR DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600)
+def fetch_economic_calendar() -> list:
+    """
+    Fetch upcoming economic events via investing.com public calendar
+    or fall back to a hardcoded list of known recurring events.
+    """
+    # Try fetching from a public economic calendar API
+    events = []
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            for e in data:
+                impact = e.get("impact", "").lower()
+                if impact in ("high", "medium"):
+                    events.append({
+                        "date":     e.get("date", ""),
+                        "time":     e.get("time", ""),
+                        "country":  e.get("country", ""),
+                        "event":    e.get("title", ""),
+                        "impact":   impact,
+                        "forecast": e.get("forecast", ""),
+                        "previous": e.get("previous", ""),
+                    })
+    except Exception:
+        pass
+
+    # Fallback: key recurring events with approximate dates
+    if not events:
+        now = datetime.now()
+        # FOMC meetings — roughly every 6 weeks
+        fomc_months = [1, 3, 5, 6, 7, 9, 11, 12]
+        for month in fomc_months:
+            if month >= now.month:
+                events.append({
+                    "date": f"2026-{month:02d}-15",
+                    "time": "14:00 ET",
+                    "country": "US",
+                    "event": "FOMC Interest Rate Decision",
+                    "impact": "high",
+                    "forecast": "—",
+                    "previous": "4.25-4.50%",
+                })
+
+        events.append({
+            "date": f"2026-{now.month:02d}-{min(now.day+7,28):02d}",
+            "time": "08:30 ET",
+            "country": "US",
+            "event": "CPI Inflation Report",
+            "impact": "high",
+            "forecast": "—",
+            "previous": "—",
+        })
+
+    return sorted(events, key=lambda x: x.get("date", ""))[:30]
+
+
+@st.cache_data(ttl=3600)
+def fetch_earnings_calendar(tickers: list) -> list:
+    """Fetch upcoming earnings dates for a list of tickers via yfinance."""
+    results = []
+    for ticker in tickers[:30]:  # cap for speed
+        try:
+            t    = yf.Ticker(ticker)
+            info = t.info or {}
+            ed   = info.get("earningsTimestamp") or info.get("earningsDate")
+            if ed:
+                if isinstance(ed, (int, float)):
+                    dt = datetime.fromtimestamp(ed)
+                elif hasattr(ed, "__iter__") and not isinstance(ed, str):
+                    dt = datetime.fromtimestamp(list(ed)[0])
+                else:
+                    continue
+                if dt >= datetime.now():
+                    results.append({
+                        "ticker": ticker,
+                        "date":   dt.strftime("%Y-%m-%d"),
+                        "time":   dt.strftime("%H:%M") if dt.hour > 0 else "TBD",
+                        "you_own": any(ticker.startswith(p) for p in YOUR_PORTFOLIO),
+                    })
+        except Exception:
+            continue
+    return sorted(results, key=lambda x: x["date"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: STOCK SCREENER
+# ══════════════════════════════════════════════════════════════════════════════
+
+if page == "📈 Stock Screener":
+    st.markdown("# 📈 Stock Screener")
+    st.caption(f"Scan {len(SCREENER_UNIVERSE)} stocks across all sectors · Momentum + RS + Volume confirmation")
+
+    with st.expander("ℹ️ How the screener works"):
+        st.markdown("""
+**Momentum Score (0-100):** Combines price vs SMA50, RSI, 1M/3M return, MACD direction, 1W return. Above 65 = strong setup.
+
+**Relative Strength vs S&P 500:** Does the stock outperform the market? Positive RS + high momentum = highest conviction.
+
+**Volume Confirmation:** A price breakout on above-average volume (>1.5x) is far more reliable than a low-volume move.
+
+**Short Interest:** High short % (>20%) can mean either a squeeze setup or a reason smart money is bearish. Context matters.
+
+**Best signals = Momentum score >65 + RS positive + Volume confirmed.** These three together significantly outperform any single indicator.
+        """)
+
+    # Filters
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        min_score = st.slider("Min Momentum Score", 0, 90, 60, 5)
+    with fc2:
+        vol_confirm = st.checkbox("Volume Confirmed Only", value=False)
+    with fc3:
+        rs_positive = st.checkbox("RS Positive vs S&P Only", value=False)
+    with fc4:
+        owned_only = st.checkbox("Show My Portfolio Only", value=False)
+
+    sector_filter = st.multiselect(
+        "Filter by Sector (leave empty = all)",
+        list(SECTOR_STOCKS.keys()),
+        default=[],
+    )
+
+    run_screen = st.button("🔍 Run Screener", type="primary")
+
+    if run_screen:
+        universe = list(YOUR_PORTFOLIO) if owned_only else SCREENER_UNIVERSE
+        with st.spinner(f"Scanning {len(universe)} stocks…"):
+            screen_df = run_stock_screener(
+                min_momentum=min_score,
+                sectors=sector_filter if sector_filter else None,
+                volume_confirmed=vol_confirm,
+                rs_positive=rs_positive,
+            )
+            if owned_only:
+                screen_df = screen_df[screen_df["Own"] == "✓"]
+
+        if screen_df.empty:
+            st.warning("No stocks match your criteria. Try lowering the momentum score threshold.")
+        else:
+            st.success(f"Found **{len(screen_df)}** stocks matching your criteria")
+
+            # Summary metrics
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("Stocks Found", len(screen_df))
+            sm2.metric("Avg Score", f"{screen_df['Score'].mean():.0f}")
+            sm3.metric("Avg 1M Return", f"{screen_df['1M%'].mean():+.1f}%")
+            sm4.metric("In Your Portfolio", f"{(screen_df['Own'] == '✓').sum()}")
+
+            st.markdown("---")
+
+            # Results cards — top 12
+            st.markdown("### 🏆 Top Results")
+            top = screen_df.head(12)
+            for row_start in range(0, len(top), 4):
+                row_items = top.iloc[row_start:row_start+4]
+                cols = st.columns(4)
+                for i, (_, row) in enumerate(row_items.iterrows()):
+                    gc = grade_color(row["Grade"])
+                    ret_c = "#00e676" if row["1M%"] >= 0 else "#ff5252"
+                    rs_c  = "#00e676" if row.get("RS 1M", 0) >= 0 else "#ff5252"
+                    vol_badge = (
+                        '<span style="background:#00e67622;color:#00e676;border:1px solid #00e67644;'
+                        'border-radius:3px;padding:1px 4px;font-size:8px">VOL ✓</span>'
+                        if row.get("Vol Ratio", 1) > 1.5 else ""
+                    )
+                    own_badge = (
+                        '<span style="background:#1D9E7522;color:#1D9E75;border:1px solid #1D9E7544;'
+                        'border-radius:3px;padding:1px 4px;font-size:8px">OWN</span>'
+                        if row["Own"] == "✓" else ""
+                    )
+                    with cols[i]:
+                        st.markdown(
+                            f'<div style="background:#1c1f26;border-radius:10px;padding:12px;'
+                            f'border-left:3px solid {gc};margin-bottom:8px">'
+                            f'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+                            f'<div>'
+                            f'<span style="font-size:15px;font-weight:700;color:#ddd">{row["Ticker"]}</span> '
+                            f'{vol_badge} {own_badge}'
+                            f'</div>'
+                            f'<span style="font-size:20px;font-weight:900;color:{gc}">{row["Score"]:.0f}</span>'
+                            f'</div>'
+                            f'{momentum_bar(int(row["Score"]), gc)}'
+                            f'<div style="display:flex;justify-content:space-between;margin-top:6px;font-size:10px">'
+                            f'<span style="color:#888">1M <b style="color:{ret_c}">{row["1M%"]:+.1f}%</b></span>'
+                            f'<span style="color:#888">RSI <b style="color:#ddd">{row["RSI"]:.0f}</b></span>'
+                            f'<span style="color:#888">RS <b style="color:{rs_c}">{row.get("RS 1M", 0):+.1f}%</b></span>'
+                            f'</div></div>',
+                            unsafe_allow_html=True
+                        )
+
+            st.markdown("---")
+            st.markdown("### 📋 Full Results Table")
+            display = screen_df.copy()
+            for col in ["1D%", "1W%", "1M%"]:
+                display[col] = display[col].map("{:+.2f}%".format)
+            display["Score"]     = display["Score"].map("{:.0f}".format)
+            display["RSI"]       = display["RSI"].map("{:.0f}".format)
+            display["vs SMA50"]  = display["vs SMA50"].map("{:+.1f}%".format)
+            display["Vol Ratio"] = display["Vol Ratio"].map("{:.2f}x".format)
+            display["RS 1M"]     = display["RS 1M"].map("{:+.1f}%".format)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+    else:
+        st.info("Set your filters above and click **Run Screener**.")
+        st.markdown("""
+**Quick presets:**
+- 🔥 **Strongest momentum:** Score >75, no other filters
+- 📈 **Breakout setups:** Score >60 + Volume Confirmed
+- 💎 **High conviction:** Score >65 + RS Positive + Volume Confirmed
+- 🏦 **Your portfolio health:** My Portfolio Only, Score >0
+        """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: PORTFOLIO RISK MONITOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "⚠️ Portfolio Risk Monitor":
+    st.markdown("# ⚠️ Portfolio Risk Monitor")
+    st.caption("Cross-references your TFSA positions against current macro regime and technical signals")
+
+    with st.expander("ℹ️ How this works"):
+        st.markdown("""
+This module reads your TFSA portfolio and runs it through three filters:
+
+1. **Macro alignment** — Is the current macro environment (VIX, yield curve, dollar) a headwind or tailwind for this position?
+2. **Technical signal** — What is the momentum score and signal for each position right now?
+3. **Concentration risk** — Are you over-exposed to sectors or themes with macro headwinds?
+
+The goal is not to tell you to sell everything — it's to flag the positions most at risk given current conditions, so you can make informed decisions about sizing and stops.
+        """)
+
+    with st.spinner("Loading macro + portfolio data…"):
+        macro_data = fetch_macro_data()
+        vix_val  = macro_data.get("VIX", {}).get("price", 18)
+        y10_val  = macro_data.get("10Y Yield", {}).get("price", 4.0)
+        y2_val   = macro_data.get("2Y Yield", {}).get("price", 4.5)
+        dxy_1m   = macro_data.get("DXY (USD)", {}).get("ret_1m", 0)
+        spread   = y10_val - y2_val
+
+    # Determine macro regime
+    if vix_val > 25:        macro_regime, regime_c = "RISK-OFF",    "#ff5252"
+    elif vix_val > 20:      macro_regime, regime_c = "CAUTIOUS",    "#ffd740"
+    elif spread < 0:        macro_regime, regime_c = "RECESSIONARY","#ff1744"
+    else:                   macro_regime, regime_c = "RISK-ON",     "#00e676"
+
+    st.markdown(
+        f'<div style="background:#1c1f26;border-radius:12px;padding:16px;margin-bottom:16px;'
+        f'border:2px solid {regime_c};text-align:center">'
+        f'<div style="font-size:11px;color:#555">CURRENT MACRO REGIME</div>'
+        f'<div style="font-size:28px;font-weight:900;color:{regime_c}">{macro_regime}</div>'
+        f'<div style="font-size:12px;color:#888">VIX {vix_val:.1f} · Yield spread {spread:+.2f}% · DXY 1M {dxy_1m:+.1f}%</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    # Macro headwinds by theme
+    THEME_MACRO_SENSITIVITY = {
+        "AI Infrastructure":              {"risk_off": "HIGH",   "rising_rates": "HIGH",   "strong_usd": "LOW"},
+        "AI Applications":                {"risk_off": "HIGH",   "rising_rates": "HIGH",   "strong_usd": "LOW"},
+        "Semiconductors":                 {"risk_off": "HIGH",   "rising_rates": "HIGH",   "strong_usd": "MEDIUM"},
+        "Nuclear & Uranium":              {"risk_off": "MEDIUM", "rising_rates": "MEDIUM", "strong_usd": "LOW"},
+        "Space, Aerospace & Defence":     {"risk_off": "MEDIUM", "rising_rates": "MEDIUM", "strong_usd": "LOW"},
+        "Quantum Computing":              {"risk_off": "HIGH",   "rising_rates": "HIGH",   "strong_usd": "LOW"},
+        "Biotech & Health Tech":          {"risk_off": "HIGH",   "rising_rates": "MEDIUM", "strong_usd": "LOW"},
+        "Fintech, Platforms & Compounders":{"risk_off":"MEDIUM", "rising_rates": "MEDIUM", "strong_usd": "LOW"},
+        "Precious Metals & Mining":       {"risk_off": "LOW",    "rising_rates": "LOW",    "strong_usd": "HIGH"},
+        "Energy & Utilities":             {"risk_off": "LOW",    "rising_rates": "LOW",    "strong_usd": "MEDIUM"},
+        "Core ETFs":                      {"risk_off": "MEDIUM", "rising_rates": "MEDIUM", "strong_usd": "MEDIUM"},
+        "Speculative / Micro-Cap":        {"risk_off": "HIGH",   "rising_rates": "HIGH",   "strong_usd": "LOW"},
+        "Tech / Software":                {"risk_off": "HIGH",   "rising_rates": "HIGH",   "strong_usd": "LOW"},
+    }
+
+    # Active headwinds
+    active_headwinds = []
+    if vix_val > 20:        active_headwinds.append("risk_off")
+    if y10_val > 4.5:       active_headwinds.append("rising_rates")
+    if dxy_1m > 2:          active_headwinds.append("strong_usd")
+
+    # Fetch portfolio signals
+    YOUR_TFSA = {
+        "AAPL": "Tech / Software", "ABCL": "Biotech & Health Tech",
+        "AMZN": "AI Infrastructure", "APLD": "AI Infrastructure",
+        "ASML": "Semiconductors", "BBAI": "AI Applications",
+        "CRWV": "AI Infrastructure", "ENB": "Energy & Utilities",
+        "LUNR": "Space, Aerospace & Defence", "META": "AI Infrastructure",
+        "MSFT": "AI Infrastructure", "NNE": "Nuclear & Uranium",
+        "NVDA": "Semiconductors", "OKLO": "Nuclear & Uranium",
+        "QBTS": "Quantum Computing", "RGTI": "Quantum Computing",
+        "SOUN": "AI Applications", "TSLA": "Tech / Software",
+        "VFV": "Core ETFs", "WPM": "Precious Metals & Mining",
+        "RXRX": "Biotech & Health Tech", "RDDT": "Fintech, Platforms & Compounders",
+    }
+
+    with st.spinner("Fetching signals for your portfolio positions…"):
+        port_signals = fetch_stock_momentum(list(YOUR_TFSA.keys())[:20])
+
+    # Build risk table
+    risk_rows = []
+    for ticker, theme in YOUR_TFSA.items():
+        sig_data = port_signals.get(ticker, {})
+        score    = sig_data.get("score", 50)
+        grade    = sig_data.get("grade", "➖ Neutral")
+        details  = sig_data.get("details", {})
+
+        # Calculate macro risk level for this position
+        sensitivity = THEME_MACRO_SENSITIVITY.get(theme, {})
+        risk_level  = 0
+        risk_reasons = []
+        for hw in active_headwinds:
+            hw_level = sensitivity.get(hw, "LOW")
+            if hw_level == "HIGH":
+                risk_level += 2
+                risk_reasons.append(f"{hw.replace('_',' ').title()} headwind")
+            elif hw_level == "MEDIUM":
+                risk_level += 1
+
+        # Technical risk
+        if score < 40:
+            risk_level += 2
+            risk_reasons.append("Weak technicals")
+        elif score < 55:
+            risk_level += 1
+
+        if risk_level >= 4:   risk_label, risk_color = "🔴 HIGH RISK",    "#ff1744"
+        elif risk_level >= 2: risk_label, risk_color = "🟡 MODERATE",     "#ffd740"
+        else:                 risk_label, risk_color = "🟢 LOW RISK",     "#00e676"
+
+        risk_rows.append({
+            "Ticker":    ticker,
+            "Theme":     theme[:22],
+            "Mom Score": score,
+            "Signal":    grade,
+            "Risk Level": risk_label,
+            "Risk Color": risk_color,
+            "Reasons":   " · ".join(risk_reasons) if risk_reasons else "No active headwinds",
+            "1M%":       details.get("ret_1m", 0),
+        })
+
+    risk_rows.sort(key=lambda x: (
+        0 if "HIGH" in x["Risk Level"] else (1 if "MODERATE" in x["Risk Level"] else 2),
+        -x["Mom Score"]
+    ))
+
+    st.markdown("---")
+    st.markdown("### 🚨 Position Risk Assessment")
+    st.caption(f"Active macro headwinds: {', '.join(active_headwinds) if active_headwinds else 'None'}")
+
+    for row in risk_rows:
+        rc  = row["Risk Color"]
+        gc  = grade_color(row["Signal"])
+        ret_c = "#00e676" if row["1M%"] >= 0 else "#ff5252"
+        st.markdown(
+            f'<div style="background:#1c1f26;border-radius:10px;padding:12px 16px;'
+            f'margin-bottom:6px;border-left:4px solid {rc}">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">'
+            f'<div>'
+            f'<span style="font-size:16px;font-weight:700;color:#ddd">{row["Ticker"]}</span>'
+            f' <span style="font-size:10px;color:#555">{row["Theme"]}</span><br>'
+            f'<span style="font-size:11px;color:#888">{row["Reasons"]}</span>'
+            f'</div>'
+            f'<div style="text-align:right;display:flex;gap:12px;align-items:center">'
+            f'<div><span style="font-size:10px;color:#555">1M</span><br>'
+            f'<span style="font-size:13px;font-weight:700;color:{ret_c}">{row["1M%"]:+.1f}%</span></div>'
+            f'<div><span style="font-size:10px;color:#555">Score</span><br>'
+            f'<span style="font-size:13px;font-weight:700;color:{gc}">{row["Mom Score"]}</span></div>'
+            f'<div><span style="font-size:11px;font-weight:700;color:{rc}">{row["Risk Level"]}</span></div>'
+            f'</div></div></div>',
+            unsafe_allow_html=True)
+
+    # Summary
+    high_risk  = [r for r in risk_rows if "HIGH" in r["Risk Level"]]
+    mod_risk   = [r for r in risk_rows if "MODERATE" in r["Risk Level"]]
+    low_risk   = [r for r in risk_rows if "LOW" in r["Risk Level"]]
+
+    st.markdown("---")
+    sr1, sr2, sr3 = st.columns(3)
+    sr1.markdown(f'<div style="background:#1c1f26;border-radius:10px;padding:14px;text-align:center;border-top:3px solid #ff1744"><div style="font-size:10px;color:#555">HIGH RISK POSITIONS</div><div style="font-size:28px;font-weight:900;color:#ff1744">{len(high_risk)}</div><div style="font-size:10px;color:#888">{", ".join(r["Ticker"] for r in high_risk[:5])}</div></div>', unsafe_allow_html=True)
+    sr2.markdown(f'<div style="background:#1c1f26;border-radius:10px;padding:14px;text-align:center;border-top:3px solid #ffd740"><div style="font-size:10px;color:#555">MODERATE RISK</div><div style="font-size:28px;font-weight:900;color:#ffd740">{len(mod_risk)}</div></div>', unsafe_allow_html=True)
+    sr3.markdown(f'<div style="background:#1c1f26;border-radius:10px;padding:14px;text-align:center;border-top:3px solid #00e676"><div style="font-size:10px;color:#555">LOW RISK</div><div style="font-size:28px;font-weight:900;color:#00e676">{len(low_risk)}</div></div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: ALERT SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🔔 Alert System":
+    st.markdown("# 🔔 Alert System")
+    st.caption("Define conditions — get a daily digest of what triggered")
+
+    with st.expander("ℹ️ How alerts work"):
+        st.markdown("""
+The alert system scans real-time data against your defined thresholds every time you open this page (cached for 15 minutes).
+
+**Available alert types:**
+- **VIX threshold** — alert when VIX crosses a level
+- **Sector RS flip** — when a sector changes quadrant on the RRG
+- **Stock SMA cross** — when price crosses above/below SMA50 or SMA200
+- **Momentum score change** — when a stock's score drops below or rises above a threshold
+- **New 52W high/low** — breakout or breakdown alerts
+        """)
+
+    # Alert definitions in session state
+    if "alerts" not in st.session_state:
+        st.session_state["alerts"] = [
+            {"type": "VIX",        "condition": "above", "value": 25,  "label": "VIX spike warning"},
+            {"type": "VIX",        "condition": "below", "value": 15,  "label": "VIX low — complacency"},
+            {"type": "Breadth",    "condition": "below", "value": 45,  "label": "Breadth deteriorating"},
+            {"type": "Momentum",   "ticker": "NVDA",  "condition": "below", "value": 50, "label": "NVDA momentum falling"},
+            {"type": "Momentum",   "ticker": "VFV",   "condition": "below", "value": 45, "label": "S&P proxy weakening"},
+        ]
+
+    # Add new alert
+    st.markdown("### ➕ Add Alert")
+    ac1, ac2, ac3, ac4, ac5 = st.columns([2, 2, 1.5, 2, 1])
+    with ac1:
+        alert_type = st.selectbox("Type", ["VIX", "Momentum", "Breadth", "Yield Spread", "DXY"])
+    with ac2:
+        if alert_type == "Momentum":
+            alert_ticker = st.text_input("Ticker", value="NVDA").upper()
+        else:
+            alert_ticker = None
+    with ac3:
+        alert_cond = st.selectbox("Condition", ["above", "below"])
+    with ac4:
+        alert_val = st.number_input("Threshold", value=25.0, step=0.5)
+    with ac5:
+        st.markdown("<div style='margin-top:28px'>", unsafe_allow_html=True)
+        if st.button("Add"):
+            label = f"{alert_type}{' ' + alert_ticker if alert_ticker else ''} {alert_cond} {alert_val}"
+            new_alert = {"type": alert_type, "condition": alert_cond, "value": float(alert_val), "label": label}
+            if alert_ticker:
+                new_alert["ticker"] = alert_ticker
+            st.session_state["alerts"].append(new_alert)
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Scan alerts
+    st.markdown("### 📡 Live Alert Scan")
+
+    with st.spinner("Scanning all alert conditions…"):
+        macro_live = fetch_macro_data()
+        vix_live   = macro_live.get("VIX", {}).get("price", 18)
+        y10_live   = macro_live.get("10Y Yield", {}).get("price", 4.0)
+        y2_live    = macro_live.get("2Y Yield", {}).get("price", 4.5)
+        dxy_live   = macro_live.get("DXY (USD)", {}).get("ret_1m", 0)
+
+        # Fetch breadth for breadth alerts
+        try:
+            breadth_live = fetch_breadth_data()
+            breadth_a50  = breadth_live.get("above_50_pct", 55)
+        except Exception:
+            breadth_a50 = 55
+
+    triggered = []
+    not_triggered = []
+
+    for alert in st.session_state["alerts"]:
+        atype = alert["type"]
+        cond  = alert["condition"]
+        val   = alert["value"]
+
+        current_val = None
+        unit = ""
+
+        if atype == "VIX":
+            current_val = vix_live
+        elif atype == "Yield Spread":
+            current_val = y10_live - y2_live
+            unit = "%"
+        elif atype == "DXY":
+            current_val = dxy_live
+            unit = "% 1M"
+        elif atype == "Breadth":
+            current_val = breadth_a50
+            unit = "%"
+        elif atype == "Momentum":
+            ticker = alert.get("ticker", "")
+            if ticker:
+                try:
+                    sig = fetch_stock_momentum([ticker])
+                    current_val = sig.get(ticker, {}).get("score", 50)
+                except Exception:
+                    current_val = 50
+
+        if current_val is None:
+            continue
+
+        fired = (cond == "above" and current_val > val) or (cond == "below" and current_val < val)
+
+        entry = {**alert, "current": current_val, "unit": unit, "fired": fired}
+        if fired:
+            triggered.append(entry)
+        else:
+            not_triggered.append(entry)
+
+    # Show triggered alerts first
+    if triggered:
+        st.markdown(f"#### 🚨 {len(triggered)} Alert(s) Triggered")
+        for a in triggered:
+            st.markdown(
+                f'<div style="background:#1c1f26;border-radius:10px;padding:14px;'
+                f'margin-bottom:8px;border:2px solid #ff5252;animation:pulse 1s infinite">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<div>'
+                f'<span style="font-size:16px;font-weight:700;color:#ff5252">🚨 {a["label"]}</span><br>'
+                f'<span style="font-size:12px;color:#aaa">{a["type"]}'
+                f'{" — " + a["ticker"] if a.get("ticker") else ""} '
+                f'is {a["condition"]} {a["value"]}{a["unit"]}</span>'
+                f'</div>'
+                f'<div style="text-align:right">'
+                f'<span style="font-size:22px;font-weight:900;color:#ff5252">'
+                f'{a["current"]:.1f}{a["unit"]}</span><br>'
+                f'<span style="font-size:10px;color:#888">threshold: {a["value"]}{a["unit"]}</span>'
+                f'</div></div></div>',
+                unsafe_allow_html=True)
+    else:
+        st.success("✅ No alerts triggered — all conditions within normal range")
+
+    if not_triggered:
+        st.markdown("---")
+        st.markdown("#### ⬜ Watching — Not Yet Triggered")
+        for a in not_triggered:
+            dist = abs(a["current"] - a["value"])
+            pct_to_trigger = dist / max(abs(a["value"]), 1) * 100
+            bar_fill = max(0, 100 - int(pct_to_trigger * 2))
+            st.markdown(
+                f'<div style="background:#1c1f26;border-radius:8px;padding:10px 14px;'
+                f'margin-bottom:5px;border-left:3px solid #2d3139">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-size:13px;color:#aaa">{a["label"]}</span>'
+                f'<span style="font-size:13px;color:#ddd">{a["current"]:.1f}{a["unit"]} '
+                f'<span style="color:#555">/ threshold {a["value"]}{a["unit"]}</span></span>'
+                f'</div>'
+                f'{momentum_bar(bar_fill, "#5c7cfa")}'
+                f'</div>',
+                unsafe_allow_html=True)
+
+    # Manage alerts
+    st.markdown("---")
+    st.markdown("#### ⚙️ Manage Alerts")
+    for i, a in enumerate(st.session_state["alerts"]):
+        col_l, col_r = st.columns([5, 1])
+        col_l.markdown(f"**{a['label']}** — {a['type']} {a['condition']} {a['value']}")
+        if col_r.button("🗑️", key=f"del_alert_{i}"):
+            st.session_state["alerts"].pop(i)
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: ECONOMIC CALENDAR
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "📅 Economic Calendar":
+    st.markdown("# 📅 Economic Calendar")
+    st.caption("Upcoming macro events + earnings dates for key tickers")
+
+    with st.expander("ℹ️ Why the calendar matters"):
+        st.markdown("""
+**Never get caught by surprise on a macro event.** The biggest single-day moves in markets are almost always caused by scheduled events — FOMC decisions, CPI prints, NFP reports, earnings releases.
+
+**Key events to watch:**
+- 🔴 **FOMC** — Interest rate decisions. If they raise/cut unexpectedly, expect 1-3% moves in S&P 500 same day
+- 🔴 **CPI** — Inflation data. Hot CPI = rate hike fears = tech selloff. Cool CPI = rally
+- 🔴 **NFP** — Jobs data. Paradox: strong jobs = Fed stays high = bad for growth stocks short-term
+- 🟡 **Earnings** — Your individual positions can move 10-20% on earnings day
+
+**Strategy:** Avoid adding new positions 1-2 days before a major event you're uncertain about.
+        """)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### 🌍 Macro Events This Week")
+        with st.spinner("Fetching economic calendar…"):
+            econ_events = fetch_economic_calendar()
+
+        if not econ_events:
+            st.info("Economic calendar data unavailable. Check back during market hours.")
+        else:
+            now_str = datetime.now().strftime("%Y-%m-%d")
+            for event in econ_events[:15]:
+                impact = event.get("impact", "medium")
+                ec = "#ff5252" if impact == "high" else "#ffd740"
+                is_past = event.get("date", "") < now_str
+                opacity = "opacity:0.5;" if is_past else ""
+                forecast_str = f" · Forecast: {event['forecast']}" if event.get("forecast") and event["forecast"] not in ("—", "") else ""
+                prev_str = f" · Prev: {event['previous']}" if event.get("previous") and event["previous"] not in ("—", "") else ""
+                st.markdown(
+                    f'<div style="background:#1c1f26;border-left:4px solid {ec};border-radius:0 8px 8px 0;'
+                    f'padding:8px 12px;margin-bottom:5px;{opacity}">'
+                    f'<div style="display:flex;justify-content:space-between">'
+                    f'<b style="color:#ddd;font-size:12px">{event.get("event","")}</b>'
+                    f'<span style="font-size:10px;color:#555">{event.get("country","")} · {event.get("time","")}</span>'
+                    f'</div>'
+                    f'<div style="font-size:10px;color:#888">{event.get("date","")}{forecast_str}{prev_str}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("### 📊 Upcoming Earnings")
+        st.caption("Key tickers across sectors + your portfolio holdings")
+
+        earnings_tickers = [
+            "NVDA", "MSFT", "AAPL", "META", "AMZN", "GOOGL", "TSLA",
+            "SOUN", "BBAI", "LUNR", "CRWV", "APLD", "NNE", "OKLO",
+            "QBTS", "RDDT", "NU", "WPM", "ENB",
+        ]
+        with st.spinner("Fetching earnings dates…"):
+            earnings = fetch_earnings_calendar(earnings_tickers)
+
+        if not earnings:
+            st.info("Could not fetch earnings dates. yfinance data may be delayed.")
+        else:
+            for e in earnings[:15]:
+                days_away = (datetime.strptime(e["date"], "%Y-%m-%d") - datetime.now()).days
+                urgency_c = "#ff5252" if days_away <= 3 else ("#ffd740" if days_away <= 7 else "#5c7cfa")
+                own_badge = ('  <span style="background:#1D9E7522;color:#1D9E75;border:1px solid #1D9E7544;'
+                             'border-radius:3px;padding:1px 5px;font-size:9px">YOU OWN</span>'
+                             if e["you_own"] else "")
+                st.markdown(
+                    f'<div style="background:#1c1f26;border-left:4px solid {urgency_c};border-radius:0 8px 8px 0;'
+                    f'padding:8px 12px;margin-bottom:5px">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<div><b style="color:#ddd">{e["ticker"]}</b>{own_badge}</div>'
+                    f'<div style="text-align:right">'
+                    f'<span style="font-size:12px;color:{urgency_c}">{e["date"]}</span><br>'
+                    f'<span style="font-size:10px;color:#555">in {days_away}d</span>'
+                    f'</div></div></div>',
+                    unsafe_allow_html=True)
+
+    # Market hours reference
+    st.markdown("---")
+    st.markdown("### 🕐 Market Hours Reference")
+    now_et = datetime.now()  # simplified
+    mh_cols = st.columns(4)
+    for i, (market, hours, tz) in enumerate([
+        ("NYSE / NASDAQ", "9:30 AM – 4:00 PM", "Eastern"),
+        ("TSX Toronto",   "9:30 AM – 4:00 PM", "Eastern"),
+        ("Euronext Paris","9:00 AM – 5:30 PM", "CET"),
+        ("Pre/Post Market","4:00 AM – 8:00 PM", "Eastern"),
+    ]):
+        mh_cols[i].markdown(
+            f'<div style="background:#1c1f26;border-radius:8px;padding:10px;text-align:center">'
+            f'<div style="font-size:11px;font-weight:700;color:#ddd">{market}</div>'
+            f'<div style="font-size:10px;color:#5c7cfa">{hours}</div>'
+            f'<div style="font-size:9px;color:#555">{tz}</div>'
+            f'</div>', unsafe_allow_html=True)
