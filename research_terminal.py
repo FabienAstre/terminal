@@ -1968,62 +1968,79 @@ def fetch_breadth_data() -> dict:
     return _fetch_breadth_yfinance_batch()
 
 
+def _fetch_history_robust(ticker: str) -> pd.Series:
+    """
+    Fetch daily close and resample to weekly.
+    More reliable than requesting weekly interval directly from yfinance.
+    """
+    for kwargs in [{"period": "2y", "interval": "1d"}, {"period": "1y", "interval": "1d"}]:
+        try:
+            hist = yf.Ticker(ticker).history(**kwargs)
+            if hist is not None and not hist.empty and len(hist) >= 20:
+                close  = hist["Close"].squeeze()
+                weekly = close.resample("W-FRI").last().dropna()
+                if len(weekly) >= 10:
+                    return weekly
+        except Exception:
+            continue
+    return pd.Series(dtype=float)
+
+
 @st.cache_data(ttl=900)
 def fetch_sector_rs_data() -> dict:
     """
     Compute Relative Strength of each sector vs S&P 500.
-    Returns RS value and RS momentum (rate of change) for RRG.
+    Fetches daily data and resamples to weekly — avoids yfinance
+    weekly interval issues. Returns RS value + momentum for RRG.
     """
-    try:
-        spy = yf.Ticker("SPY").history(period="1y", interval="1w")
-        if spy.empty:
-            return {}
-        spy_close = spy["Close"].squeeze()
-    except Exception:
+    spy_close = _fetch_history_robust("SPY")
+    if spy_close.empty:
+        spy_close = _fetch_history_robust("^GSPC")
+    if spy_close.empty:
         return {}
 
     results = {}
     for sector, etf in SECTOR_ETFS.items():
         try:
-            t = yf.Ticker(etf)
-            hist = t.history(period="1y", interval="1w")
-            if hist.empty:
+            etf_close = _fetch_history_robust(etf)
+            if etf_close.empty:
                 continue
-            etf_close = hist["Close"].squeeze()
 
-            # Align
             combined = pd.concat([etf_close, spy_close], axis=1).dropna()
+            if len(combined) < 10:
+                continue
             combined.columns = ["etf", "spy"]
 
-            # RS ratio
             rs_ratio = combined["etf"] / combined["spy"]
+            base     = rs_ratio.iloc[0]
+            if base == 0:
+                continue
+            rs_norm  = (rs_ratio / base) * 100
+            n        = len(rs_norm)
 
-            # Normalise to 100 base over last 52 weeks
-            if len(rs_ratio) >= 52:
-                rs_norm = (rs_ratio / rs_ratio.iloc[-52]) * 100
-            else:
-                rs_norm = (rs_ratio / rs_ratio.iloc[0]) * 100
+            rs_value    = float(rs_norm.iloc[-1])
+            rs_4w       = float(rs_norm.iloc[-4])  if n >= 4  else rs_value
+            rs_8w       = float(rs_norm.iloc[-8])  if n >= 8  else rs_4w
+            rs_12w      = float(rs_norm.iloc[-12]) if n >= 12 else rs_8w
+            rs_prior    = float(rs_norm.iloc[-5])  if n >= 5  else float(rs_norm.iloc[0])
+            rs_momentum = (rs_value / rs_prior - 1) * 100 if rs_prior != 0 else 0.0
 
-            # RS Momentum = rate of change of RS ratio (1M vs 3M)
-            if len(rs_norm) >= 12:
-                rs_momentum = float((rs_norm.iloc[-1] / rs_norm.iloc[-5] - 1) * 100)
-            else:
-                rs_momentum = 0.0
-
-            rs_value = float(rs_norm.iloc[-1])
-
-            # 4-week and 12-week RS for momentum direction
-            rs_4w  = float(rs_norm.iloc[-4])  if len(rs_norm) >= 4  else rs_value
-            rs_12w = float(rs_norm.iloc[-12]) if len(rs_norm) >= 12 else rs_value
+            ret_1w = float((combined["etf"].iloc[-1] / combined["etf"].iloc[-2]  - 1) * 100) if n >= 2  else 0
+            ret_1m = float((combined["etf"].iloc[-1] / combined["etf"].iloc[-5]  - 1) * 100) if n >= 5  else 0
+            ret_3m = float((combined["etf"].iloc[-1] / combined["etf"].iloc[-13] - 1) * 100) if n >= 13 else 0
 
             results[sector] = {
                 "etf":         etf,
                 "rs_value":    round(rs_value, 2),
                 "rs_momentum": round(rs_momentum, 2),
                 "rs_4w":       round(rs_4w, 2),
+                "rs_8w":       round(rs_8w, 2),
                 "rs_12w":      round(rs_12w, 2),
                 "improving":   rs_value > rs_4w,
-                "hist":        hist,
+                "ret_1w":      round(ret_1w, 2),
+                "ret_1m":      round(ret_1m, 2),
+                "ret_3m":      round(ret_3m, 2),
+                "weeks":       n,
             }
         except Exception:
             continue
