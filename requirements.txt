@@ -6,3 +6,4 @@ plotly
 requests
 pytrends
 praw
+beautifulsoup4
