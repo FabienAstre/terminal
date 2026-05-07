@@ -665,6 +665,10 @@ def render_etf_card(name: str, data: dict, color: str) -> str:
 with st.sidebar:
     st.markdown("## 🔬 Research Terminal")
     page = st.radio("Module", [
+        "🌍 Macro Dashboard",
+        "🔄 Sector Rotation (RRG)",
+        "📊 Market Breadth",
+        "📰 AI News Sentiment",
         "📡 Momentum Scanner",
         "💬 Social Sentiment",
         "🏢 Sector Drill-Down",
@@ -1326,3 +1330,1679 @@ elif page == "🏦 Market Researcher":
                 brief = research_sector(research_topic)
             st.markdown(f"## 🔬 {research_topic}")
             st.markdown(brief)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW DATA LAYERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300)
+def fetch_macro_data() -> dict:
+    """Fetch macro indicators — rates, dollar, commodities, volatility."""
+    tickers = {
+        # Rates & Bonds
+        "10Y Yield":      "^TNX",
+        "2Y Yield":       "^IRX",
+        "30Y Yield":      "^TYX",
+        "HYG (Junk)":     "HYG",
+        "IEI (IG Bond)":  "IEI",
+        # Volatility
+        "VIX":            "^VIX",
+        "VIX3M":          "^VIX3M",
+        "VVIX":           "^VVIX",
+        # Dollar & FX
+        "DXY (USD)":      "DX-Y.NYB",
+        "USD/CAD":        "CADUSD=X",
+        "EUR/USD":        "EURUSD=X",
+        # Commodities
+        "Gold":           "GLD",
+        "Oil (WTI)":      "USO",
+        "Copper":         "CPER",
+        "Silver":         "SLV",
+        # Risk appetite
+        "Bitcoin":        "BTC-USD",
+        "S&P 500":        "^GSPC",
+        "Russell 2000":   "IWM",
+        "Nasdaq":         "^IXIC",
+    }
+    results = {}
+    for name, ticker in tickers.items():
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="3mo", interval="1d")
+            if hist.empty:
+                continue
+            close = hist["Close"].squeeze()
+            price = float(close.iloc[-1])
+            ret_1d = (price / float(close.iloc[-2]) - 1) * 100 if len(close) >= 2 else 0
+            ret_1w = (price / float(close.iloc[-6]) - 1) * 100 if len(close) >= 6 else ret_1d
+            ret_1m = (price / float(close.iloc[-22]) - 1) * 100 if len(close) >= 22 else ret_1w
+            ret_3m = (price / float(close.iloc[0]) - 1) * 100 if len(close) >= 60 else ret_1m
+            results[name] = {
+                "ticker": ticker, "price": price,
+                "ret_1d": round(ret_1d, 2), "ret_1w": round(ret_1w, 2),
+                "ret_1m": round(ret_1m, 2), "ret_3m": round(ret_3m, 2),
+                "hist": hist,
+            }
+        except Exception:
+            continue
+    return results
+
+
+@st.cache_data(ttl=600)
+def fetch_fear_greed() -> dict:
+    """Fetch CNN Fear & Greed index via public API."""
+    try:
+        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            score = data.get("fear_and_greed", {}).get("score", 50)
+            rating = data.get("fear_and_greed", {}).get("rating", "Neutral")
+            prev_close = data.get("fear_and_greed", {}).get("previous_close", score)
+            prev_1w = data.get("fear_and_greed", {}).get("previous_1_week", score)
+            prev_1m = data.get("fear_and_greed", {}).get("previous_1_month", score)
+            return {
+                "score": round(float(score), 1),
+                "rating": rating,
+                "prev_close": round(float(prev_close), 1),
+                "prev_1w": round(float(prev_1w), 1),
+                "prev_1m": round(float(prev_1m), 1),
+                "available": True,
+            }
+    except Exception:
+        pass
+    return {"score": 50, "rating": "Neutral", "available": False}
+
+
+def _scrape_finviz_page(url: str, headers: dict) -> list:
+    """Scrape one page of Finviz screener results. Returns list of row dicts."""
+    import re
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return []
+        # Parse the table rows from Finviz HTML
+        from html.parser import HTMLParser
+
+        class FinvizParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.rows = []
+                self.current_row = []
+                self.in_table = False
+                self.in_row = False
+                self.in_cell = False
+                self.cell_data = ""
+                self.row_count = 0
+
+            def handle_starttag(self, tag, attrs):
+                attrs_dict = dict(attrs)
+                if tag == "tr":
+                    cls = attrs_dict.get("class", "")
+                    if "screener-row" in cls or "row-" in cls:
+                        self.in_row = True
+                        self.current_row = []
+                if tag == "td" and self.in_row:
+                    self.in_cell = True
+                    self.cell_data = ""
+
+            def handle_endtag(self, tag):
+                if tag == "td" and self.in_cell:
+                    self.current_row.append(self.cell_data.strip())
+                    self.in_cell = False
+                if tag == "tr" and self.in_row:
+                    if len(self.current_row) > 5:
+                        self.rows.append(self.current_row)
+                    self.in_row = False
+                    self.current_row = []
+
+            def handle_data(self, data):
+                if self.in_cell:
+                    self.cell_data += data
+
+        parser = FinvizParser()
+        parser.feed(resp.text)
+        return parser.rows
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900)
+def fetch_finviz_breadth() -> dict:
+    """
+    Full market breadth from Finviz screener.
+    Covers 8,000+ US stocks (NYSE + NASDAQ + AMEX).
+    Uses Finviz export CSV — most reliable method.
+    Returns breadth broken down by market cap tier and sector.
+    """
+    import csv, io
+
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://finviz.com/screener.ashx",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    # Finviz export URL — columns: Ticker, Company, Sector, Industry, Country,
+    # Market Cap, P/E, Price, Change, Volume, SMA20, SMA50, SMA200, 52W High, 52W Low
+    # v=152 = technical view, o=-marketcap = sorted by market cap desc
+    base_export = "https://finviz.com/export.ashx?v=152&f=geo_usa&o=-marketcap&c=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68"
+
+    all_rows = []
+    try:
+        resp = requests.get(base_export, headers=HEADERS, timeout=25)
+        if resp.status_code == 200 and len(resp.text) > 500:
+            reader = csv.DictReader(io.StringIO(resp.text))
+            all_rows = list(reader)
+    except Exception:
+        pass
+
+    # If CSV export blocked, try scraping the screener pages
+    if not all_rows:
+        # Fallback: scrape multiple pages of screener
+        # Each page = 20 stocks, we scrape up to 50 pages = 1000 stocks
+        screener_base = "https://finviz.com/screener.ashx?v=152&f=geo_usa&o=-marketcap"
+        for offset in range(0, 1001, 20):
+            url = f"{screener_base}&r={offset + 1}"
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                if resp.status_code != 200:
+                    break
+                rows = _scrape_finviz_page(url, HEADERS)
+                if not rows:
+                    break
+                all_rows.extend(rows)
+                time.sleep(0.15)
+            except Exception:
+                break
+
+    if not all_rows:
+        # Final fallback: use yfinance batch for broader universe
+        return _fetch_breadth_yfinance_batch()
+
+    # Parse the data
+    return _parse_finviz_breadth(all_rows)
+
+
+def _parse_finviz_breadth(rows: list) -> dict:
+    """Parse Finviz rows into breadth metrics."""
+    # Market cap tiers (USD)
+    CAP_TIERS = {
+        "Mega Cap (>$200B)":    200e9,
+        "Large Cap ($10-200B)": 10e9,
+        "Mid Cap ($2-10B)":     2e9,
+        "Small Cap ($300M-2B)": 300e6,
+        "Micro Cap (<$300M)":   0,
+    }
+
+    total = 0
+    above_50 = above_200 = new_highs = new_lows = advancing = declining = 0
+
+    # By cap tier
+    tier_data = {tier: {"total": 0, "above_50": 0, "above_200": 0,
+                        "new_highs": 0, "new_lows": 0, "advancing": 0, "declining": 0}
+                 for tier in CAP_TIERS}
+
+    # By sector
+    sector_data = {}
+
+    for row in rows:
+        try:
+            # Handle both dict (CSV) and list (scraped) formats
+            if isinstance(row, dict):
+                ticker   = row.get("Ticker", "")
+                sector   = row.get("Sector", "Unknown")
+                mktcap_s = row.get("Market Cap", "0")
+                price_s  = row.get("Price", "0")
+                change_s = row.get("Change", "0")
+                sma50_s  = row.get("SMA50", "") or row.get("50D High", "")
+                sma200_s = row.get("SMA200", "") or row.get("200D High", "")
+                high52_s = row.get("52W High", "") or row.get("52W High From Price", "")
+                low52_s  = row.get("52W Low", "")  or row.get("52W Low From Price", "")
+            else:
+                # List format from scraper — column order varies
+                if len(row) < 10:
+                    continue
+                ticker   = row[0] if len(row) > 0 else ""
+                sector   = row[3] if len(row) > 3 else "Unknown"
+                mktcap_s = row[5] if len(row) > 5 else "0"
+                price_s  = row[7] if len(row) > 7 else "0"
+                change_s = row[8] if len(row) > 8 else "0"
+                sma50_s  = ""
+                sma200_s = ""
+                high52_s = ""
+                low52_s  = ""
+
+            if not ticker or ticker == "Ticker":
+                continue
+
+            # Parse market cap
+            mktcap = _parse_finviz_number(mktcap_s)
+            price  = _parse_finviz_number(price_s)
+            change = _parse_finviz_pct(change_s)
+
+            if price <= 0:
+                continue
+
+            # Parse SMA distance (Finviz shows % from SMA)
+            sma50_dist  = _parse_finviz_pct(sma50_s)   # % above/below SMA50
+            sma200_dist = _parse_finviz_pct(sma200_s)  # % above/below SMA200
+            high52_dist = _parse_finviz_pct(high52_s)  # % from 52W high (negative = below)
+            low52_dist  = _parse_finviz_pct(low52_s)   # % from 52W low (positive = above)
+
+            # Breadth flags
+            is_above_50  = sma50_dist  > 0  if sma50_s  else None
+            is_above_200 = sma200_dist > 0  if sma200_s else None
+            is_new_high  = high52_dist >= -2 if high52_s else False  # within 2% of 52W high
+            is_new_low   = low52_dist  <= 2  if low52_s  else False  # within 2% of 52W low
+            is_advancing = change > 0
+            is_declining = change < 0
+
+            # Totals
+            total += 1
+            if is_above_50  is True:  above_50  += 1
+            if is_above_200 is True:  above_200 += 1
+            if is_new_high:           new_highs += 1
+            if is_new_low:            new_lows  += 1
+            if is_advancing:          advancing += 1
+            if is_declining:          declining += 1
+
+            # Cap tier breakdown
+            tier = _get_cap_tier(mktcap, CAP_TIERS)
+            if tier in tier_data:
+                td = tier_data[tier]
+                td["total"] += 1
+                if is_above_50  is True: td["above_50"]  += 1
+                if is_above_200 is True: td["above_200"] += 1
+                if is_new_high:          td["new_highs"] += 1
+                if is_new_low:           td["new_lows"]  += 1
+                if is_advancing:         td["advancing"] += 1
+                if is_declining:         td["declining"] += 1
+
+            # Sector breakdown
+            if sector not in sector_data:
+                sector_data[sector] = {"total": 0, "above_50": 0, "above_200": 0,
+                                       "advancing": 0, "declining": 0}
+            sd = sector_data[sector]
+            sd["total"] += 1
+            if is_above_50  is True: sd["above_50"]  += 1
+            if is_above_200 is True: sd["above_200"] += 1
+            if is_advancing:         sd["advancing"] += 1
+            if is_declining:         sd["declining"] += 1
+
+        except Exception:
+            continue
+
+    if total == 0:
+        return _fetch_breadth_yfinance_batch()
+
+    # Compute percentages for tier data
+    tier_summary = {}
+    for tier, td in tier_data.items():
+        if td["total"] == 0:
+            continue
+        tier_summary[tier] = {
+            "total":         td["total"],
+            "above_50_pct":  round(td["above_50"]  / td["total"] * 100, 1),
+            "above_200_pct": round(td["above_200"] / td["total"] * 100, 1),
+            "new_highs":     td["new_highs"],
+            "new_lows":      td["new_lows"],
+            "ad_ratio":      round(td["advancing"] / max(td["declining"], 1), 2),
+        }
+
+    # Sector summary
+    sector_summary = {}
+    for sec, sd in sector_data.items():
+        if sd["total"] < 5 or sec in ("", "Unknown"):
+            continue
+        sector_summary[sec] = {
+            "total":         sd["total"],
+            "above_50_pct":  round(sd["above_50"]  / sd["total"] * 100, 1),
+            "above_200_pct": round(sd["above_200"] / sd["total"] * 100, 1),
+            "ad_ratio":      round(sd["advancing"] / max(sd["declining"], 1), 2),
+        }
+
+    return {
+        "source":        "Finviz",
+        "total":         total,
+        "above_50_pct":  round(above_50  / total * 100, 1),
+        "above_200_pct": round(above_200 / total * 100, 1),
+        "new_highs":     new_highs,
+        "new_lows":      new_lows,
+        "advancing":     advancing,
+        "declining":     declining,
+        "ad_ratio":      round(advancing / max(declining, 1), 2),
+        "hl_ratio":      round(new_highs / max(new_lows, 1), 2),
+        "tier_summary":  tier_summary,
+        "sector_summary": sector_summary,
+    }
+
+
+def _parse_finviz_number(s: str) -> float:
+    """Parse Finviz number strings like '1.23B', '456M', '12.3K'."""
+    if not s or s in ("-", "N/A", ""):
+        return 0.0
+    s = s.strip().replace(",", "").replace("%", "")
+    multipliers = {"T": 1e12, "B": 1e9, "M": 1e6, "K": 1e3}
+    for suffix, mult in multipliers.items():
+        if s.upper().endswith(suffix):
+            try:
+                return float(s[:-1]) * mult
+            except ValueError:
+                return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_finviz_pct(s: str) -> float:
+    """Parse percentage string like '+12.34%' or '-5.67%'."""
+    if not s or s in ("-", "N/A", ""):
+        return 0.0
+    try:
+        return float(str(s).replace("%", "").replace("+", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def _get_cap_tier(mktcap: float, tiers: dict) -> str:
+    """Classify market cap into tier."""
+    if mktcap >= 200e9: return "Mega Cap (>$200B)"
+    if mktcap >= 10e9:  return "Large Cap ($10-200B)"
+    if mktcap >= 2e9:   return "Mid Cap ($2-10B)"
+    if mktcap >= 300e6: return "Small Cap ($300M-2B)"
+    return "Micro Cap (<$300M)"
+
+
+@st.cache_data(ttl=900)
+def _fetch_breadth_yfinance_batch() -> dict:
+    """
+    Fallback breadth engine using yfinance batch download.
+    Downloads all tickers in chunks of 100 — covers ~500 stocks efficiently.
+    Much faster than one-by-one because yfinance.download() parallelises.
+    """
+    # Extended universe — S&P500 + Russell 1000 proxies across all sectors
+    FULL_UNIVERSE = {
+        "Technology": [
+            "AAPL","MSFT","NVDA","AVGO","AMD","ORCL","ADBE","CRM","INTC","QCOM",
+            "TXN","MU","AMAT","LRCX","KLAC","MRVL","FTNT","CDNS","SNPS","ANSS",
+            "KEYS","TRMB","EPAM","OKTA","ZS","CRWD","NET","DDOG","MDB","SNOW",
+        ],
+        "Healthcare": [
+            "LLY","UNH","JNJ","ABBV","MRK","TMO","ABT","DHR","BMY","AMGN",
+            "GILD","VRTX","REGN","ISRG","SYK","MDT","ZBH","BAX","HOLX","HSIC",
+            "IQV","CRL","CTLT","PDCO","PRGO","JAZZ","INCY","ALKS","EXEL","RARE",
+        ],
+        "Financials": [
+            "BRK-B","JPM","V","MA","BAC","WFC","GS","MS","BLK","SCHW",
+            "AXP","C","USB","PNC","TFC","COF","MTB","KEY","RF","HBAN",
+            "CFG","FITB","WBS","EWBC","IBOC","FHN","SNV","BOKF","UMBF","FFIN",
+        ],
+        "Consumer Discretionary": [
+            "AMZN","TSLA","HD","MCD","NKE","LOW","SBUX","BKNG","TJX","CMG",
+            "ORLY","ROST","GM","F","MAR","HLT","YUM","DRI","POOL","WSM",
+            "RH","BBWI","PVH","RL","TPR","HBI","UAA","SKX","CROX","DECK",
+        ],
+        "Industrials": [
+            "GE","CAT","HON","UPS","BA","RTX","LMT","DE","MMM","ETN",
+            "EMR","FDX","GD","NOC","ITW","PH","ROK","CMI","IR","XYL",
+            "GNRC","CARR","OTIS","TT","JCI","SWK","GWW","MSM","FAST","WSO",
+        ],
+        "Communication Services": [
+            "META","GOOGL","GOOG","NFLX","DIS","TMUS","VZ","T","CHTR","EA",
+            "TTWO","WBD","PARA","LYV","MTCH","SNAP","PINS","RDDT","ZM","TWLO",
+        ],
+        "Energy": [
+            "XOM","CVX","COP","EOG","SLB","MPC","PSX","VLO","PXD","OXY",
+            "HES","DVN","HAL","BKR","FANG","MRO","APA","CTRA","MTDR","CHX",
+        ],
+        "Consumer Staples": [
+            "PG","KO","PEP","COST","WMT","PM","MO","CL","EL","GIS",
+            "KHC","SJM","CHD","CLX","KMB","CAG","CPB","MKC","HRL","SMPL",
+        ],
+        "Materials": [
+            "LIN","APD","ECL","SHW","FCX","NEM","NUE","VMC","MLM","DOW",
+            "DD","PPG","IFF","ALB","MOS","CF","ICL","SCCO","MP","USLM",
+        ],
+        "Real Estate": [
+            "PLD","AMT","EQIX","CCI","PSA","DLR","O","WELL","SPG","AVB",
+            "EQR","VICI","WY","ARE","BXP","HST","EXR","CUBE","REXR","COLD",
+        ],
+        "Utilities": [
+            "NEE","SO","DUK","AEP","SRE","D","EXC","XEL","WEC","ES",
+            "ETR","FE","CMS","NI","AES","AWK","ATO","CNP","OGE","PNW",
+        ],
+        # Extended — Mid & Small caps for better breadth signal
+        "Mid Cap Growth": [
+            "CELH","SAIA","UFPI","TREX","AXON","MEDP","HLNE","CSWI","AAON","CVCO",
+            "MGNI","RELY","SFM","PTCT","INSP","TMDX","NTRA","RXST","ENSG","ATGE",
+        ],
+        "Small Cap": [
+            "SMTC","ARIS","GRBK","BOOT","KTOS","POWL","DXPE","GKOS","PRCT","HIMS",
+            "ACVA","BRZE","SOUN","LUNR","RDW","JOBY","NNE","OKLO","QBTS","RGTI",
+        ],
+        "Canada TSX": [
+            "SHOP.TO","RY.TO","TD.TO","ENB.TO","CNR.TO","CP.TO","BCE.TO","BMO.TO",
+            "BNS.TO","MFC.TO","SU.TO","ABX.TO","TRI.TO","WPM.TO","ATD.TO","NTR.TO",
+            "CNQ.TO","IMO.TO","AEM.TO","K.TO","FM.TO","CS.TO","ERO.TO","TECK-B.TO",
+        ],
+    }
+
+    all_tickers = []
+    ticker_sector = {}
+    for sector, tickers in FULL_UNIVERSE.items():
+        for t in tickers:
+            if t not in ticker_sector:
+                all_tickers.append(t)
+                ticker_sector[t] = sector
+
+    # Batch download in chunks of 100
+    CHUNK_SIZE = 100
+    all_close  = {}
+
+    for i in range(0, len(all_tickers), CHUNK_SIZE):
+        chunk = all_tickers[i:i + CHUNK_SIZE]
+        try:
+            data = yf.download(
+                chunk, period="1y", interval="1d",
+                group_by="ticker", auto_adjust=True,
+                progress=False, threads=True,
+            )
+            for ticker in chunk:
+                try:
+                    if len(chunk) == 1:
+                        close_s = data["Close"].squeeze()
+                    else:
+                        close_s = data[ticker]["Close"].squeeze()
+                    if not close_s.empty and len(close_s) >= 20:
+                        all_close[ticker] = close_s
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Compute breadth
+    above_50 = above_200 = new_highs = new_lows = advancing = declining = total = 0
+
+    CAP_TIERS = [
+        "Mega Cap (>$200B)", "Large Cap ($10-200B)",
+        "Mid Cap ($2-10B)", "Small Cap ($300M-2B)", "Micro Cap (<$300M)"
+    ]
+    # Rough tier by sector grouping
+    SECTOR_TIER_MAP = {
+        "Technology": "Large Cap ($10-200B)",
+        "Healthcare": "Large Cap ($10-200B)",
+        "Financials": "Large Cap ($10-200B)",
+        "Consumer Discretionary": "Large Cap ($10-200B)",
+        "Industrials": "Large Cap ($10-200B)",
+        "Communication Services": "Large Cap ($10-200B)",
+        "Energy": "Large Cap ($10-200B)",
+        "Consumer Staples": "Large Cap ($10-200B)",
+        "Materials": "Large Cap ($10-200B)",
+        "Real Estate": "Large Cap ($10-200B)",
+        "Utilities": "Large Cap ($10-200B)",
+        "Mid Cap Growth": "Mid Cap ($2-10B)",
+        "Small Cap": "Small Cap ($300M-2B)",
+        "Canada TSX": "Large Cap ($10-200B)",
+    }
+
+    tier_data   = {t: {"total": 0, "above_50": 0, "above_200": 0,
+                       "new_highs": 0, "new_lows": 0,
+                       "advancing": 0, "declining": 0} for t in CAP_TIERS}
+    sector_data = {}
+
+    for ticker, close_s in all_close.items():
+        try:
+            price = float(close_s.iloc[-1])
+            prev  = float(close_s.iloc[-2]) if len(close_s) >= 2 else price
+            sec   = ticker_sector.get(ticker, "Unknown")
+
+            a50 = a200 = False
+            if len(close_s) >= 50:
+                sma50 = float(close_s.rolling(50).mean().iloc[-1])
+                a50   = price > sma50
+            if len(close_s) >= 200:
+                sma200 = float(close_s.rolling(200).mean().iloc[-1])
+                a200   = price > sma200
+
+            high_52w = float(close_s.max())
+            low_52w  = float(close_s.min())
+            is_nh = price >= high_52w * 0.98
+            is_nl = price <= low_52w  * 1.02
+            adv   = price > prev
+            dec   = price < prev
+
+            total    += 1
+            if a50:  above_50  += 1
+            if a200: above_200 += 1
+            if is_nh: new_highs += 1
+            if is_nl: new_lows  += 1
+            if adv:  advancing += 1
+            if dec:  declining += 1
+
+            # Tier
+            tier = SECTOR_TIER_MAP.get(sec, "Mid Cap ($2-10B)")
+            td   = tier_data[tier]
+            td["total"] += 1
+            if a50:   td["above_50"]  += 1
+            if a200:  td["above_200"] += 1
+            if is_nh: td["new_highs"] += 1
+            if is_nl: td["new_lows"]  += 1
+            if adv:   td["advancing"] += 1
+            if dec:   td["declining"] += 1
+
+            # Sector
+            if sec not in sector_data:
+                sector_data[sec] = {"total": 0, "above_50": 0, "above_200": 0,
+                                    "advancing": 0, "declining": 0}
+            sd = sector_data[sec]
+            sd["total"] += 1
+            if a50:  sd["above_50"]  += 1
+            if a200: sd["above_200"] += 1
+            if adv:  sd["advancing"] += 1
+            if dec:  sd["declining"] += 1
+
+        except Exception:
+            continue
+
+    if total == 0:
+        return {}
+
+    tier_summary = {}
+    for tier, td in tier_data.items():
+        if td["total"] == 0:
+            continue
+        tier_summary[tier] = {
+            "total":         td["total"],
+            "above_50_pct":  round(td["above_50"]  / td["total"] * 100, 1),
+            "above_200_pct": round(td["above_200"] / td["total"] * 100, 1),
+            "new_highs":     td["new_highs"],
+            "new_lows":      td["new_lows"],
+            "ad_ratio":      round(td["advancing"] / max(td["declining"], 1), 2),
+        }
+
+    sector_summary = {}
+    for sec, sd in sector_data.items():
+        if sd["total"] < 3 or sec in ("", "Unknown"):
+            continue
+        sector_summary[sec] = {
+            "total":         sd["total"],
+            "above_50_pct":  round(sd["above_50"]  / sd["total"] * 100, 1),
+            "above_200_pct": round(sd["above_200"] / sd["total"] * 100, 1),
+            "ad_ratio":      round(sd["advancing"] / max(sd["declining"], 1), 2),
+        }
+
+    return {
+        "source":         "yfinance batch",
+        "total":          total,
+        "above_50_pct":   round(above_50  / total * 100, 1),
+        "above_200_pct":  round(above_200 / total * 100, 1),
+        "new_highs":      new_highs,
+        "new_lows":       new_lows,
+        "advancing":      advancing,
+        "declining":      declining,
+        "ad_ratio":       round(advancing / max(declining, 1), 2),
+        "hl_ratio":       round(new_highs / max(new_lows, 1), 2),
+        "tier_summary":   tier_summary,
+        "sector_summary": sector_summary,
+    }
+
+
+# Public alias — always try Finviz first, fall back to yfinance batch
+@st.cache_data(ttl=900)
+def fetch_breadth_data() -> dict:
+    """
+    Full market breadth.
+    Primary: Finviz (8,000+ US stocks, pre-computed, fast).
+    Fallback: yfinance batch download (~400 stocks across all sectors + TSX).
+    """
+    result = fetch_finviz_breadth()
+    if result and result.get("total", 0) > 100:
+        return result
+    return _fetch_breadth_yfinance_batch()
+
+
+@st.cache_data(ttl=900)
+def fetch_sector_rs_data() -> dict:
+    """
+    Compute Relative Strength of each sector vs S&P 500.
+    Returns RS value and RS momentum (rate of change) for RRG.
+    """
+    try:
+        spy = yf.Ticker("SPY").history(period="1y", interval="1w")
+        if spy.empty:
+            return {}
+        spy_close = spy["Close"].squeeze()
+    except Exception:
+        return {}
+
+    results = {}
+    for sector, etf in SECTOR_ETFS.items():
+        try:
+            t = yf.Ticker(etf)
+            hist = t.history(period="1y", interval="1w")
+            if hist.empty:
+                continue
+            etf_close = hist["Close"].squeeze()
+
+            # Align
+            combined = pd.concat([etf_close, spy_close], axis=1).dropna()
+            combined.columns = ["etf", "spy"]
+
+            # RS ratio
+            rs_ratio = combined["etf"] / combined["spy"]
+
+            # Normalise to 100 base over last 52 weeks
+            if len(rs_ratio) >= 52:
+                rs_norm = (rs_ratio / rs_ratio.iloc[-52]) * 100
+            else:
+                rs_norm = (rs_ratio / rs_ratio.iloc[0]) * 100
+
+            # RS Momentum = rate of change of RS ratio (1M vs 3M)
+            if len(rs_norm) >= 12:
+                rs_momentum = float((rs_norm.iloc[-1] / rs_norm.iloc[-5] - 1) * 100)
+            else:
+                rs_momentum = 0.0
+
+            rs_value = float(rs_norm.iloc[-1])
+
+            # 4-week and 12-week RS for momentum direction
+            rs_4w  = float(rs_norm.iloc[-4])  if len(rs_norm) >= 4  else rs_value
+            rs_12w = float(rs_norm.iloc[-12]) if len(rs_norm) >= 12 else rs_value
+
+            results[sector] = {
+                "etf":         etf,
+                "rs_value":    round(rs_value, 2),
+                "rs_momentum": round(rs_momentum, 2),
+                "rs_4w":       round(rs_4w, 2),
+                "rs_12w":      round(rs_12w, 2),
+                "improving":   rs_value > rs_4w,
+                "hist":        hist,
+            }
+        except Exception:
+            continue
+    return results
+
+
+@st.cache_data(ttl=1800)
+def fetch_sector_news_and_sentiment(sectors: list) -> dict:
+    """
+    Fetch recent headlines for sector ETFs via yfinance
+    then use Claude to score sentiment.
+    """
+    results = {}
+    for sector in sectors:
+        etf = SECTOR_ETFS.get(sector)
+        if not etf:
+            continue
+        try:
+            t = yf.Ticker(etf)
+            news = t.news or []
+            headlines = []
+            for n in news[:6]:
+                ct = n.get("content", {})
+                title = ct.get("title") or n.get("title", "")
+                if title:
+                    headlines.append(title)
+
+            if not headlines:
+                results[sector] = {"score": 50, "grade": "Neutral", "headlines": [], "summary": "No headlines found."}
+                continue
+
+            # Ask Claude to score
+            prompt = f"""Sector: {sector} (ETF: {etf})
+
+Recent headlines:
+{chr(10).join(f'• {h}' for h in headlines)}
+
+Score the overall sentiment for this sector from these headlines.
+Respond in JSON only, no other text:
+{{"score": <0-100>, "grade": "<Very Bearish|Bearish|Neutral|Bullish|Very Bullish>", "summary": "<one sentence max>"}}"""
+
+            response = call_claude(
+                "You are a financial news sentiment analyser. Respond only with valid JSON.",
+                prompt,
+                max_tokens=120,
+            )
+
+            try:
+                import re
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    results[sector] = {
+                        "score":     parsed.get("score", 50),
+                        "grade":     parsed.get("grade", "Neutral"),
+                        "summary":   parsed.get("summary", ""),
+                        "headlines": headlines,
+                    }
+                else:
+                    results[sector] = {"score": 50, "grade": "Neutral", "headlines": headlines, "summary": response[:120]}
+            except Exception:
+                results[sector] = {"score": 50, "grade": "Neutral", "headlines": headlines, "summary": "Parse error"}
+
+        except Exception:
+            results[sector] = {"score": 50, "grade": "Neutral", "headlines": [], "summary": "Error fetching data"}
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: MACRO DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+if page == "🌍 Macro Dashboard":
+    st.markdown("# 🌍 Macro Dashboard")
+    st.caption(f"Global macro pulse — rates, dollar, commodities, volatility, risk appetite · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    with st.spinner("Fetching macro data…"):
+        macro = fetch_macro_data()
+        fg    = fetch_fear_greed()
+
+    if not macro:
+        st.error("Could not fetch macro data.")
+        st.stop()
+
+    # ── Fear & Greed ──────────────────────────────────────────────────────────
+    st.markdown("### 😨 CNN Fear & Greed Index")
+    if fg["available"]:
+        fg_score = fg["score"]
+        if fg_score >= 75:   fg_c, fg_label = "#ff6b35", "Extreme Greed"
+        elif fg_score >= 55: fg_c, fg_label = "#ffd740", "Greed"
+        elif fg_score >= 45: fg_c, fg_label = "#888",    "Neutral"
+        elif fg_score >= 25: fg_c, fg_label = "#5c7cfa", "Fear"
+        else:                fg_c, fg_label = "#90caf9", "Extreme Fear"
+
+        fgc1, fgc2, fgc3, fgc4, fgc5 = st.columns(5)
+        fgc1.markdown(
+            f'<div style="background:#1c1f26;border-radius:12px;padding:16px;text-align:center;border-top:4px solid {fg_c}">'
+            f'<div style="font-size:10px;color:#555;text-transform:uppercase">NOW</div>'
+            f'<div style="font-size:36px;font-weight:900;color:{fg_c}">{fg_score:.0f}</div>'
+            f'<div style="font-size:12px;color:{fg_c};font-weight:700">{fg_label}</div>'
+            f'</div>', unsafe_allow_html=True)
+        for col, label, val in [
+            (fgc2, "Yesterday", fg["prev_close"]),
+            (fgc3, "1 Week Ago", fg["prev_1w"]),
+            (fgc4, "1 Month Ago", fg["prev_1m"]),
+        ]:
+            if val >= 75:   vc, vl = "#ff6b35", "Extreme Greed"
+            elif val >= 55: vc, vl = "#ffd740", "Greed"
+            elif val >= 45: vc, vl = "#888",    "Neutral"
+            elif val >= 25: vc, vl = "#5c7cfa", "Fear"
+            else:           vc, vl = "#90caf9", "Extreme Fear"
+            col.markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:16px;text-align:center;border-top:2px solid {vc}">'
+                f'<div style="font-size:10px;color:#555;text-transform:uppercase">{label}</div>'
+                f'<div style="font-size:28px;font-weight:800;color:{vc}">{val:.0f}</div>'
+                f'<div style="font-size:11px;color:{vc}">{vl}</div>'
+                f'</div>', unsafe_allow_html=True)
+
+        # Trend arrow
+        trend = fg_score - fg["prev_1w"]
+        trend_c = "#00e676" if trend > 5 else ("#ff5252" if trend < -5 else "#ffd740")
+        fgc5.markdown(
+            f'<div style="background:#1c1f26;border-radius:12px;padding:16px;text-align:center;border-top:2px solid {trend_c}">'
+            f'<div style="font-size:10px;color:#555;text-transform:uppercase">1W TREND</div>'
+            f'<div style="font-size:36px;font-weight:900;color:{trend_c}">{"▲" if trend > 0 else "▼"}</div>'
+            f'<div style="font-size:13px;color:{trend_c}">{trend:+.1f} pts</div>'
+            f'</div>', unsafe_allow_html=True)
+    else:
+        st.info("Fear & Greed data unavailable — CNN API may be rate limiting.")
+
+    st.markdown("---")
+
+    # ── Volatility Regime ─────────────────────────────────────────────────────
+    st.markdown("### ⚡ Volatility Regime")
+    vix_data  = macro.get("VIX", {})
+    vvix_data = macro.get("VVIX", {})
+    v3m_data  = macro.get("VIX3M", {})
+
+    if vix_data:
+        vix_val = vix_data["price"]
+        if vix_val < 15:   vix_regime, vix_c = "LOW VOLATILITY — Risk On", "#00e676"
+        elif vix_val < 20: vix_regime, vix_c = "NORMAL — Cautiously Bullish", "#69f0ae"
+        elif vix_val < 25: vix_regime, vix_c = "ELEVATED — Risk Increasing", "#ffd740"
+        elif vix_val < 35: vix_regime, vix_c = "HIGH — Risk Off", "#ff5252"
+        else:              vix_regime, vix_c = "EXTREME FEAR — Capitulation Zone", "#ff1744"
+
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.markdown(
+            f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:4px solid {vix_c}">'
+            f'<div style="font-size:10px;color:#555">VIX</div>'
+            f'<div style="font-size:32px;font-weight:900;color:{vix_c}">{vix_val:.1f}</div>'
+            f'<div style="font-size:10px;color:{vix_c}">{vix_regime}</div>'
+            f'</div>', unsafe_allow_html=True)
+
+        if v3m_data and vix_data:
+            term_struct = vix_data["price"] - v3m_data["price"]
+            ts_c = "#ff5252" if term_struct > 0 else "#00e676"
+            ts_label = "BACKWARDATION ⚠️" if term_struct > 0 else "CONTANGO ✓"
+            ts_desc  = "Near-term fear > future → caution" if term_struct > 0 else "Calm near-term, normal structure"
+            vc2.markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {ts_c}">'
+                f'<div style="font-size:10px;color:#555">VIX TERM STRUCTURE</div>'
+                f'<div style="font-size:20px;font-weight:800;color:{ts_c}">{ts_label}</div>'
+                f'<div style="font-size:11px;color:#aaa">VIX {vix_val:.1f} vs VIX3M {v3m_data["price"]:.1f}</div>'
+                f'<div style="font-size:10px;color:#555">{ts_desc}</div>'
+                f'</div>', unsafe_allow_html=True)
+
+        if vvix_data:
+            vvix_val = vvix_data["price"]
+            vvix_c = "#ff5252" if vvix_val > 120 else ("#ffd740" if vvix_val > 100 else "#00e676")
+            vc3.markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {vvix_c}">'
+                f'<div style="font-size:10px;color:#555">VVIX (Vol of Vol)</div>'
+                f'<div style="font-size:32px;font-weight:900;color:{vvix_c}">{vvix_val:.0f}</div>'
+                f'<div style="font-size:10px;color:#555">Volatility of VIX itself</div>'
+                f'</div>', unsafe_allow_html=True)
+
+        vix_1w_c = "#ff5252" if vix_data["ret_1w"] > 0 else "#00e676"
+        vc4.markdown(
+            f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {vix_1w_c}">'
+            f'<div style="font-size:10px;color:#555">VIX 1W CHANGE</div>'
+            f'<div style="font-size:32px;font-weight:900;color:{vix_1w_c}">{vix_data["ret_1w"]:+.1f}%</div>'
+            f'<div style="font-size:10px;color:#555">{"Rising fear" if vix_data["ret_1w"] > 0 else "Easing fear"}</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Yield Curve ───────────────────────────────────────────────────────────
+    st.markdown("### 📈 Yield Curve & Credit")
+    y10 = macro.get("10Y Yield", {})
+    y2  = macro.get("2Y Yield", {})
+    y30 = macro.get("30Y Yield", {})
+    hyg = macro.get("HYG (Junk)", {})
+    iei = macro.get("IEI (IG Bond)", {})
+
+    yc1, yc2, yc3, yc4 = st.columns(4)
+    if y10 and y2:
+        spread = y10["price"] - y2["price"]
+        spread_c = "#00e676" if spread > 0.5 else ("#ffd740" if spread > 0 else "#ff5252")
+        spread_label = "Normal ✓" if spread > 0.5 else ("Flat ⚠️" if spread > 0 else "INVERTED 🚨")
+        yc1.markdown(
+            f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:4px solid {spread_c}">'
+            f'<div style="font-size:10px;color:#555">2Y/10Y SPREAD</div>'
+            f'<div style="font-size:28px;font-weight:900;color:{spread_c}">{spread:+.2f}%</div>'
+            f'<div style="font-size:11px;color:{spread_c}">{spread_label}</div>'
+            f'<div style="font-size:10px;color:#555">2Y: {y2["price"]:.2f}% · 10Y: {y10["price"]:.2f}%</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    for col, name, data in [(yc2, "10Y Yield", y10), (yc3, "2Y Yield", y2), (yc4, "30Y Yield", y30)]:
+        if data:
+            c = "#ff5252" if data["ret_1w"] > 0 else "#00e676"
+            col.markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {c}">'
+                f'<div style="font-size:10px;color:#555">{name}</div>'
+                f'<div style="font-size:28px;font-weight:900;color:#ddd">{data["price"]:.2f}%</div>'
+                f'<div style="font-size:11px;color:{c}">1W: {data["ret_1w"]:+.2f}%</div>'
+                f'</div>', unsafe_allow_html=True)
+
+    # Credit spread proxy
+    if hyg and iei:
+        st.markdown("---")
+        credit_ratio = hyg["ret_1m"] - iei["ret_1m"]
+        credit_c = "#00e676" if credit_ratio > 0 else "#ff5252"
+        credit_label = "Risk-On — junk outperforming" if credit_ratio > 0 else "Risk-Off — flight to quality"
+        st.markdown(
+            f'<div style="background:#1c1f26;border-radius:8px;padding:10px 16px;border-left:4px solid {credit_c};font-size:13px">'
+            f'<b style="color:{credit_c}">Credit Spread Signal:</b> '
+            f'<span style="color:#aaa">HYG vs IEI 1M: <b style="color:{credit_c}">{credit_ratio:+.2f}%</b> — {credit_label}</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Dollar & FX ───────────────────────────────────────────────────────────
+    st.markdown("### 💵 Dollar & FX")
+    fx_names = ["DXY (USD)", "USD/CAD", "EUR/USD"]
+    fx_cols  = st.columns(len(fx_names))
+    for i, name in enumerate(fx_names):
+        data = macro.get(name, {})
+        if not data:
+            continue
+        c1m = "#ff5252" if data["ret_1m"] > 0 else "#00e676"
+        # For DXY: rising dollar = risk-off signal
+        if "DXY" in name:
+            dxy_regime = "Strong USD — headwind for commodities & EM" if data["ret_1m"] > 2 else (
+                "Weak USD — tailwind for gold, EM, commodities" if data["ret_1m"] < -2 else "USD Neutral")
+            fx_cols[i].markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {c1m}">'
+                f'<div style="font-size:10px;color:#555">{name}</div>'
+                f'<div style="font-size:24px;font-weight:900;color:#ddd">{data["price"]:.2f}</div>'
+                f'<div style="font-size:11px;color:{c1m}">1M: {data["ret_1m"]:+.2f}%</div>'
+                f'<div style="font-size:10px;color:#555">{dxy_regime}</div>'
+                f'</div>', unsafe_allow_html=True)
+        else:
+            fx_cols[i].markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {c1m}">'
+                f'<div style="font-size:10px;color:#555">{name}</div>'
+                f'<div style="font-size:24px;font-weight:900;color:#ddd">{data["price"]:.4f}</div>'
+                f'<div style="font-size:11px;color:{c1m}">1M: {data["ret_1m"]:+.2f}%</div>'
+                f'</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Commodities ───────────────────────────────────────────────────────────
+    st.markdown("### 🥇 Commodities & Risk Appetite")
+    comm_names = ["Gold", "Oil (WTI)", "Copper", "Silver", "Bitcoin"]
+    comm_cols  = st.columns(len(comm_names))
+    for i, name in enumerate(comm_names):
+        data = macro.get(name, {})
+        if not data:
+            continue
+        c = "#00e676" if data["ret_1m"] > 0 else "#ff5252"
+        comm_cols[i].markdown(
+            f'<div style="background:#1c1f26;border-radius:12px;padding:14px;text-align:center;border-top:3px solid {c}">'
+            f'<div style="font-size:10px;color:#555">{name}</div>'
+            f'<div style="font-size:18px;font-weight:700;color:#ddd">${data["price"]:,.2f}</div>'
+            f'<div style="font-size:11px;color:{"#00e676" if data["ret_1d"]>=0 else "#ff5252"}">1D: {data["ret_1d"]:+.2f}%</div>'
+            f'<div style="font-size:11px;color:{c}">1M: {data["ret_1m"]:+.2f}%</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    # Gold/Oil ratio
+    gold = macro.get("Gold", {})
+    oil  = macro.get("Oil (WTI)", {})
+    if gold and oil and oil["price"] > 0:
+        go_ratio = gold["price"] / oil["price"]
+        go_c = "#ffd740" if go_ratio > 25 else "#00e676"
+        go_label = "Defensive — gold expensive vs oil, risk-off signal" if go_ratio > 25 else "Growth — oil strong vs gold, risk-on"
+        st.markdown(
+            f'<div style="background:#1c1f26;border-radius:8px;padding:10px 16px;border-left:4px solid {go_c};font-size:13px;margin-top:8px">'
+            f'<b style="color:{go_c}">Gold/Oil Ratio:</b> '
+            f'<span style="color:#aaa"><b style="color:#ddd">{go_ratio:.1f}x</b> — {go_label}</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Macro Summary ─────────────────────────────────────────────────────────
+    st.markdown("### 🧭 Macro Regime Summary")
+
+    # Build regime signals
+    signals = []
+    if vix_data:
+        vix_v = vix_data["price"]
+        if vix_v < 18:
+            signals.append(("✅", "Low VIX", f"{vix_v:.1f} — Market calm, risk-on environment", "#00e676"))
+        elif vix_v > 25:
+            signals.append(("🚨", "High VIX", f"{vix_v:.1f} — Elevated fear, de-risk or wait", "#ff5252"))
+        else:
+            signals.append(("⚠️", "Moderate VIX", f"{vix_v:.1f} — Cautious positioning warranted", "#ffd740"))
+
+    if y10 and y2:
+        spread = y10["price"] - y2["price"]
+        if spread < 0:
+            signals.append(("🚨", "Inverted Yield Curve", f"Spread {spread:+.2f}% — Recession warning", "#ff5252"))
+        elif spread < 0.3:
+            signals.append(("⚠️", "Flat Yield Curve", f"Spread {spread:+.2f}% — Growth concern", "#ffd740"))
+        else:
+            signals.append(("✅", "Normal Yield Curve", f"Spread {spread:+.2f}% — Healthy structure", "#00e676"))
+
+    if fg["available"]:
+        if fg["score"] > 75:
+            signals.append(("⚠️", "Extreme Greed", f"F&G {fg['score']:.0f} — Contrarian caution, market may be frothy", "#ff6b35"))
+        elif fg["score"] < 25:
+            signals.append(("✅", "Extreme Fear", f"F&G {fg['score']:.0f} — Historically good entry zone", "#00e676"))
+
+    btc = macro.get("Bitcoin", {})
+    if btc:
+        if btc["ret_1m"] > 15:
+            signals.append(("✅", "BTC Risk Appetite", f"+{btc['ret_1m']:.1f}% 1M — Speculative appetite strong", "#F7931A"))
+        elif btc["ret_1m"] < -15:
+            signals.append(("🚨", "BTC Weakness", f"{btc['ret_1m']:.1f}% 1M — Risk appetite fading", "#ff5252"))
+
+    for icon, title, desc, color in signals:
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {color};border-radius:0 10px 10px 0;'
+            f'padding:10px 14px;margin-bottom:6px">'
+            f'<span style="font-size:14px">{icon}</span> '
+            f'<b style="color:{color}">{title}</b> '
+            f'<span style="color:#888;font-size:12px">— {desc}</span>'
+            f'</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: SECTOR ROTATION RRG
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🔄 Sector Rotation (RRG)":
+    st.markdown("# 🔄 Sector Rotation — Relative Rotation Graph")
+    st.caption("Each sector plotted by Relative Strength vs S&P 500 (x-axis) and RS Momentum (y-axis)")
+
+    with st.expander("ℹ️ How to read this chart"):
+        st.markdown("""
+**Quadrants — clockwise rotation is the typical cycle:**
+
+| Quadrant | RS Value | RS Momentum | Meaning |
+|----------|----------|-------------|---------|
+| 🟢 **Leading** (top-right) | Above 100 | Positive | Strong and accelerating — be here |
+| 🔵 **Weakening** (bottom-right) | Above 100 | Negative | Was strong, now fading — start reducing |
+| 🔴 **Lagging** (bottom-left) | Below 100 | Negative | Weak and worsening — avoid |
+| 🟡 **Recovering** (top-left) | Below 100 | Positive | Was weak, now improving — early entry |
+
+**The tail** shows the last 4 weeks of movement — direction of travel matters as much as position.
+        """)
+
+    with st.spinner("Computing relative strength for all 11 sectors…"):
+        rs_data = fetch_sector_rs_data()
+
+    if not rs_data:
+        st.error("Could not compute relative strength data.")
+        st.stop()
+
+    # Build RRG dataframe
+    rrg_rows = []
+    for sector, data in rs_data.items():
+        rrg_rows.append({
+            "Sector":      sector,
+            "ETF":         data["etf"],
+            "RS_Value":    data["rs_value"],
+            "RS_Momentum": data["rs_momentum"],
+            "Improving":   data["improving"],
+            "Color":       SECTOR_COLORS.get(sector, "#888"),
+        })
+    rrg_df = pd.DataFrame(rrg_rows)
+
+    # Determine quadrant
+    def get_quadrant(rs_val, rs_mom):
+        if rs_val >= 100 and rs_mom >= 0:  return "🟢 Leading"
+        if rs_val >= 100 and rs_mom < 0:   return "🔵 Weakening"
+        if rs_val < 100  and rs_mom < 0:   return "🔴 Lagging"
+        return "🟡 Recovering"
+
+    rrg_df["Quadrant"] = rrg_df.apply(lambda r: get_quadrant(r["RS_Value"], r["RS_Momentum"]), axis=1)
+
+    quad_colors = {
+        "🟢 Leading":    "#00e676",
+        "🔵 Weakening":  "#5c7cfa",
+        "🔴 Lagging":    "#ff5252",
+        "🟡 Recovering": "#ffd740",
+    }
+
+    # ── RRG Plot ──────────────────────────────────────────────────────────────
+    fig = go.Figure()
+
+    # Quadrant background shading
+    x_mid = 100
+    y_mid = 0
+    x_range = [rrg_df["RS_Value"].min() - 2, rrg_df["RS_Value"].max() + 2]
+    y_range = [rrg_df["RS_Momentum"].min() - 1, rrg_df["RS_Momentum"].max() + 1]
+
+    # Shaded quadrant regions
+    for x0, x1, y0, y1, color, label in [
+        (x_range[0], x_mid, y_mid, y_range[1], "rgba(255,215,64,0.06)",  "RECOVERING"),
+        (x_mid, x_range[1], y_mid, y_range[1], "rgba(0,230,118,0.06)",   "LEADING"),
+        (x_range[0], x_mid, y_range[0], y_mid, "rgba(255,82,82,0.06)",   "LAGGING"),
+        (x_mid, x_range[1], y_range[0], y_mid, "rgba(92,124,250,0.06)",  "WEAKENING"),
+    ]:
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1,
+            fillcolor=color, line=dict(width=0), layer="below")
+
+    # Quadrant labels
+    for x, y, label, color in [
+        (x_mid + (x_range[1]-x_mid)*0.75, y_range[1]*0.85, "LEADING",    "#00e676"),
+        (x_mid + (x_range[1]-x_mid)*0.75, y_range[0]*0.85, "WEAKENING",  "#5c7cfa"),
+        (x_range[0] + (x_mid-x_range[0])*0.25, y_range[0]*0.85, "LAGGING", "#ff5252"),
+        (x_range[0] + (x_mid-x_range[0])*0.25, y_range[1]*0.85, "RECOVERING", "#ffd740"),
+    ]:
+        fig.add_annotation(x=x, y=y, text=f"<b>{label}</b>",
+            showarrow=False, font=dict(color=color, size=11), opacity=0.5)
+
+    # Dividing lines
+    fig.add_hline(y=0,   line_dash="dash", line_color="#444", line_width=1)
+    fig.add_vline(x=100, line_dash="dash", line_color="#444", line_width=1)
+
+    # Tail lines (RS trajectory)
+    for _, row in rrg_df.iterrows():
+        rs_data_sector = rs_data.get(row["Sector"], {})
+        rs4w = rs_data_sector.get("rs_4w", row["RS_Value"])
+        fig.add_trace(go.Scatter(
+            x=[rs4w, row["RS_Value"]],
+            y=[0, row["RS_Momentum"]],
+            mode="lines",
+            line=dict(color=row["Color"], width=1.5, dash="dot"),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    # Sector bubbles
+    fig.add_trace(go.Scatter(
+        x=rrg_df["RS_Value"],
+        y=rrg_df["RS_Momentum"],
+        mode="markers+text",
+        text=rrg_df["ETF"],
+        textposition="top center",
+        marker=dict(
+            size=18,
+            color=rrg_df["Color"].tolist(),
+            line=dict(width=2, color="#0e1117"),
+        ),
+        customdata=rrg_df[["Sector", "RS_Value", "RS_Momentum", "Quadrant"]].values,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "RS Value: %{customdata[1]:.1f}<br>"
+            "RS Momentum: %{customdata[2]:.2f}%<br>"
+            "Quadrant: %{customdata[3]}<extra></extra>"
+        ),
+        name="Sectors",
+    ))
+
+    fig.update_layout(
+        height=600,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#ccc",
+        xaxis=dict(
+            title="Relative Strength vs S&P 500 (100 = neutral)",
+            gridcolor="#1a1d24", zeroline=False,
+            range=x_range,
+        ),
+        yaxis=dict(
+            title="RS Momentum (% change, 4-week)",
+            gridcolor="#1a1d24", zeroline=False,
+            range=y_range,
+        ),
+        showlegend=False,
+        margin=dict(t=20, b=40, l=60, r=20),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Quadrant Summary Cards ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📋 Sector Quadrant Summary")
+
+    q_cols = st.columns(4)
+    for i, (quad, qcolor) in enumerate([
+        ("🟢 Leading", "#00e676"), ("🔵 Weakening", "#5c7cfa"),
+        ("🟡 Recovering", "#ffd740"), ("🔴 Lagging", "#ff5252"),
+    ]):
+        sectors_in_quad = rrg_df[rrg_df["Quadrant"] == quad]
+        with q_cols[i]:
+            st.markdown(
+                f'<div style="background:#1c1f26;border-radius:12px;padding:14px;'
+                f'border-top:4px solid {qcolor};min-height:120px">'
+                f'<div style="font-size:13px;font-weight:700;color:{qcolor};margin-bottom:8px">{quad} ({len(sectors_in_quad)})</div>'
+                + "".join(
+                    f'<div style="font-size:12px;color:#aaa;margin-bottom:3px">'
+                    f'<b style="color:#ddd">{row["ETF"]}</b> {row["Sector"][:20]}'
+                    f'</div>'
+                    for _, row in sectors_in_quad.iterrows()
+                ) +
+                f'</div>', unsafe_allow_html=True)
+
+    # ── RS Table ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📊 Full Relative Strength Table")
+    display_df = rrg_df[["Sector", "ETF", "RS_Value", "RS_Momentum", "Quadrant"]].copy()
+    display_df["RS_Value"]    = display_df["RS_Value"].map("{:.1f}".format)
+    display_df["RS_Momentum"] = display_df["RS_Momentum"].map("{:+.2f}%".format)
+    display_df = display_df.sort_values("Quadrant")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.caption("RS Value > 100 = outperforming S&P 500 · RS Momentum positive = improving relative strength · Dotted tails show 4-week trajectory")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: MARKET BREADTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "📊 Market Breadth":
+    st.markdown("# 📊 Market Breadth")
+    st.caption("Full market breadth — 8,000+ US stocks via Finviz + TSX · Separates real rallies from narrow melt-ups")
+
+    with st.expander("ℹ️ Why breadth matters + data sources"):
+        st.markdown("""
+**Primary source: Finviz** (8,000+ US stocks — NYSE, NASDAQ, AMEX) — pre-computed technical data, updates every few minutes during market hours.
+
+**Fallback: yfinance batch** (~400 stocks across all sectors + TSX top 24) — used if Finviz is unavailable.
+
+**Key signals:**
+- **% above SMA50/200** — above 70% = healthy broad market · below 40% = warning
+- **Advance/Decline ratio** — above 1.5 = broad buying · below 0.7 = distribution
+- **New Highs vs New Lows** — trend health indicator
+- **Cap tier divergence** — if Mega caps healthy but Small caps weak = narrowing rally, elevated risk
+- **Sector breadth** — which sectors have the most participation
+
+**The warning sign to watch:** Index near highs + Mega caps strong + Small/Mid caps weak = narrow leadership. This precedes most corrections by 2-6 weeks.
+        """)
+
+    with st.spinner("Loading full market breadth data… (Finviz: 8,000+ stocks · first load ~15s)"):
+        breadth = fetch_breadth_data()
+
+    if not breadth:
+        st.error("Could not load breadth data.")
+        st.stop()
+
+    total  = breadth["total"]
+    source = breadth.get("source", "yfinance")
+
+    # Source badge
+    src_c = "#00e676" if "Finviz" in source else "#ffd740"
+    st.markdown(
+        f'<div style="background:#1c1f26;border-radius:6px;padding:6px 12px;'
+        f'border-left:3px solid {src_c};font-size:11px;color:#aaa;margin-bottom:12px;display:inline-block">'
+        f'📡 Data source: <b style="color:{src_c}">{source}</b> · '
+        f'<b style="color:#ddd">{total:,}</b> stocks analysed'
+        f'</div>', unsafe_allow_html=True)
+
+    # ── Key Breadth Metrics ───────────────────────────────────────────────────
+    st.markdown("### 📐 Market-Wide Breadth")
+    b1, b2, b3, b4, b5, b6 = st.columns(6)
+
+    a50  = breadth["above_50_pct"]
+    a200 = breadth["above_200_pct"]
+    ad   = breadth["ad_ratio"]
+    nh   = breadth["new_highs"]
+    nl   = breadth["new_lows"]
+    hl   = breadth["hl_ratio"]
+
+    a50_c  = "#00e676" if a50  > 65 else ("#ffd740" if a50  > 45 else "#ff5252")
+    a200_c = "#00e676" if a200 > 60 else ("#ffd740" if a200 > 40 else "#ff5252")
+    ad_c   = "#00e676" if ad   > 1.5 else ("#ffd740" if ad   > 0.8 else "#ff5252")
+    nh_c   = "#00e676" if nh   > 50  else ("#ffd740" if nh   > 20  else "#ff5252")
+    nl_c   = "#00e676" if nl   < 20  else ("#ffd740" if nl   < 50  else "#ff5252")
+    hl_c   = "#00e676" if hl   > 3   else ("#ffd740" if hl   > 1   else "#ff5252")
+
+    for col, label, val, color, sub in [
+        (b1, "% ABOVE SMA50",   f"{a50:.0f}%",  a50_c,  "Healthy" if a50>65 else ("Neutral" if a50>45 else "Weak")),
+        (b2, "% ABOVE SMA200",  f"{a200:.0f}%", a200_c, "Bullish" if a200>60 else ("Mixed" if a200>40 else "Bearish")),
+        (b3, "ADV/DEC RATIO",   f"{ad:.2f}",    ad_c,   f"{breadth['advancing']:,} adv · {breadth['declining']:,} dec"),
+        (b4, "NEW 52W HIGHS",   f"{nh:,}",      nh_c,   f"of {total:,} tracked"),
+        (b5, "NEW 52W LOWS",    f"{nl:,}",      nl_c,   f"of {total:,} tracked"),
+        (b6, "HIGH/LOW RATIO",  f"{hl:.1f}x",   hl_c,   "Bullish" if hl>3 else ("Mixed" if hl>1 else "Bearish")),
+    ]:
+        col.markdown(
+            f'<div style="background:#1c1f26;border-radius:10px;padding:12px;text-align:center;border-top:3px solid {color}">'
+            f'<div style="font-size:9px;color:#555;text-transform:uppercase">{label}</div>'
+            f'<div style="font-size:24px;font-weight:900;color:{color}">{val}</div>'
+            f'<div style="font-size:9px;color:#555">{sub}</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Breadth Score + A/D Chart ─────────────────────────────────────────────
+    breadth_score = round((
+        (a50 / 100 * 30) + (a200 / 100 * 25) +
+        (min(ad / 2, 1) * 25) + (min(hl / 5, 1) * 20)
+    ) * 100, 1)
+
+    if breadth_score >= 70:   bs_label, bs_c = "BROAD BULL MARKET",  "#00e676"
+    elif breadth_score >= 55: bs_label, bs_c = "HEALTHY MARKET",     "#69f0ae"
+    elif breadth_score >= 45: bs_label, bs_c = "MIXED SIGNALS",      "#ffd740"
+    elif breadth_score >= 30: bs_label, bs_c = "NARROW / WEAK",      "#ff5252"
+    else:                     bs_label, bs_c = "BREADTH BREAKDOWN",  "#ff1744"
+
+    col_gauge, col_chart = st.columns([1, 2])
+    with col_gauge:
+        st.markdown(
+            f'<div style="background:#1c1f26;border-radius:16px;padding:24px;text-align:center;border:3px solid {bs_c}">'
+            f'<div style="font-size:11px;color:#555;text-transform:uppercase">Breadth Health Score</div>'
+            f'<div style="font-size:56px;font-weight:900;color:{bs_c}">{breadth_score:.0f}</div>'
+            f'<div style="font-size:13px;font-weight:700;color:{bs_c}">{bs_label}</div>'
+            f'<div style="background:#2a2d35;border-radius:8px;height:10px;margin-top:14px">'
+            f'<div style="width:{breadth_score}%;background:{bs_c};height:100%;border-radius:8px"></div></div>'
+            f'<div style="font-size:9px;color:#555;margin-top:6px">{total:,} stocks · {source}</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    with col_chart:
+        fig_ad = go.Figure()
+        flat = max(total - breadth["advancing"] - breadth["declining"], 0)
+        fig_ad.add_trace(go.Bar(
+            x=["Advancing", "Declining", "Unchanged"],
+            y=[breadth["advancing"], breadth["declining"], flat],
+            marker_color=["#00e676", "#ff5252", "#888"],
+            text=[f'{breadth["advancing"]:,}', f'{breadth["declining"]:,}', f'{flat:,}'],
+            textposition="outside",
+        ))
+        fig_ad.update_layout(
+            height=260, title=f"Today's Market — {total:,} Stocks",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#ccc", showlegend=False,
+            yaxis=dict(gridcolor="#2d3139"),
+            xaxis=dict(gridcolor="rgba(0,0,0,0)"),
+            margin=dict(t=40, b=10, l=20, r=20),
+        )
+        st.plotly_chart(fig_ad, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Market Cap Tier Breakdown ─────────────────────────────────────────────
+    tier_summary = breadth.get("tier_summary", {})
+    if tier_summary:
+        st.markdown("### 🏗️ Breadth by Market Cap Tier")
+        st.caption("The most important divergence signal — when Mega caps are fine but Small/Mid caps are breaking down")
+
+        tier_order = [
+            "Mega Cap (>$200B)", "Large Cap ($10-200B)",
+            "Mid Cap ($2-10B)", "Small Cap ($300M-2B)", "Micro Cap (<$300M)"
+        ]
+        tier_colors_map = {
+            "Mega Cap (>$200B)":    "#378ADD",
+            "Large Cap ($10-200B)": "#5DCAA5",
+            "Mid Cap ($2-10B)":     "#ffd740",
+            "Small Cap ($300M-2B)": "#EF9F27",
+            "Micro Cap (<$300M)":   "#ff5252",
+        }
+
+        tier_cols = st.columns(len([t for t in tier_order if t in tier_summary]))
+        col_idx = 0
+        for tier in tier_order:
+            td = tier_summary.get(tier)
+            if not td:
+                continue
+            tc   = tier_colors_map.get(tier, "#888")
+            a50t = td["above_50_pct"]
+            a200t= td["above_200_pct"]
+            adt  = td["ad_ratio"]
+            a50t_c = "#00e676" if a50t > 65 else ("#ffd740" if a50t > 45 else "#ff5252")
+
+            with tier_cols[col_idx]:
+                st.markdown(
+                    f'<div style="background:#1c1f26;border-radius:12px;padding:14px;border-top:4px solid {tc}">'
+                    f'<div style="font-size:11px;font-weight:700;color:{tc};margin-bottom:8px">{tier}</div>'
+                    f'<div style="font-size:10px;color:#555">{td["total"]:,} stocks</div>'
+                    f'<div style="margin-top:8px">'
+                    f'<div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa">'
+                    f'<span>Above SMA50</span><b style="color:{a50t_c}">{a50t:.0f}%</b></div>'
+                    f'{momentum_bar(int(a50t), a50t_c)}'
+                    f'</div>'
+                    f'<div style="margin-top:6px">'
+                    f'<div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa">'
+                    f'<span>Above SMA200</span><b style="color:{"#00e676" if a200t>60 else "#ff5252"}">{a200t:.0f}%</b></div>'
+                    f'{momentum_bar(int(a200t), "#00e676" if a200t>60 else "#ff5252")}'
+                    f'</div>'
+                    f'<div style="margin-top:8px;font-size:11px;color:#aaa">'
+                    f'A/D: <b style="color:{"#00e676" if adt>1.2 else "#ff5252"}">{adt:.2f}</b> · '
+                    f'Highs: <b style="color:#ddd">{td["new_highs"]}</b> / Lows: <b style="color:#ddd">{td["new_lows"]}</b>'
+                    f'</div>'
+                    f'</div>', unsafe_allow_html=True)
+            col_idx += 1
+
+        # Cap tier heatmap chart
+        st.markdown("---")
+        tier_chart_data = [(t, tier_summary[t]) for t in tier_order if t in tier_summary]
+        fig_tier = go.Figure()
+        fig_tier.add_trace(go.Bar(
+            name="% Above SMA50",
+            x=[t[0].split(" (")[0] for t in tier_chart_data],
+            y=[t[1]["above_50_pct"] for t in tier_chart_data],
+            marker_color=[tier_colors_map.get(t[0], "#888") for t in tier_chart_data],
+            opacity=0.9,
+        ))
+        fig_tier.add_trace(go.Bar(
+            name="% Above SMA200",
+            x=[t[0].split(" (")[0] for t in tier_chart_data],
+            y=[t[1]["above_200_pct"] for t in tier_chart_data],
+            marker_color=[tier_colors_map.get(t[0], "#888") for t in tier_chart_data],
+            opacity=0.4,
+        ))
+        fig_tier.add_hline(y=50, line_dash="dash", line_color="#555", opacity=0.5,
+            annotation_text="50% line", annotation_font_color="#555")
+        fig_tier.update_layout(
+            barmode="group", height=320,
+            title="SMA50 vs SMA200 Participation by Cap Tier",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#ccc",
+            yaxis=dict(gridcolor="#2d3139", title="% of Stocks", range=[0, 105]),
+            xaxis=dict(gridcolor="rgba(0,0,0,0)"),
+            legend=dict(orientation="h", y=1.1),
+            margin=dict(t=50, b=20),
+        )
+        st.plotly_chart(fig_tier, use_container_width=True)
+        st.caption("⚠️ Watch for Mega/Large cap bars staying high while Small/Micro bars drop — classic narrow rally warning")
+
+    st.markdown("---")
+
+    # ── Sector Breadth Breakdown ──────────────────────────────────────────────
+    sector_summary = breadth.get("sector_summary", {})
+    if sector_summary:
+        st.markdown("### 🏭 Breadth by Sector")
+        sorted_sectors = sorted(sector_summary.items(), key=lambda x: x[1]["above_50_pct"], reverse=True)
+
+        sec_df_rows = []
+        for sec, sd in sorted_sectors:
+            sec_df_rows.append({
+                "Sector": sec,
+                "Stocks": sd["total"],
+                "% Above SMA50":  sd["above_50_pct"],
+                "% Above SMA200": sd["above_200_pct"],
+                "A/D Ratio":      sd["ad_ratio"],
+                "Health": "🟢 Strong" if sd["above_50_pct"] > 65 else (
+                           "🟡 Mixed"  if sd["above_50_pct"] > 45 else "🔴 Weak"),
+            })
+        sec_df = pd.DataFrame(sec_df_rows)
+
+        fig_sec = go.Figure()
+        fig_sec.add_trace(go.Bar(
+            x=sec_df["Sector"],
+            y=sec_df["% Above SMA50"],
+            name="% Above SMA50",
+            marker_color=["#00e676" if v > 65 else ("#ffd740" if v > 45 else "#ff5252")
+                          for v in sec_df["% Above SMA50"]],
+            text=sec_df["% Above SMA50"].map("{:.0f}%".format),
+            textposition="outside",
+        ))
+        fig_sec.add_hline(y=50, line_dash="dash", line_color="#555", opacity=0.5)
+        fig_sec.update_layout(
+            height=360, title="% of Stocks Above SMA50 by Sector",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#ccc", showlegend=False,
+            xaxis=dict(gridcolor="rgba(0,0,0,0)", tickangle=-30),
+            yaxis=dict(gridcolor="#2d3139", title="% Above SMA50", range=[0, 115]),
+            margin=dict(t=40, b=80),
+        )
+        st.plotly_chart(fig_sec, use_container_width=True)
+        st.dataframe(sec_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Breadth Interpretation ────────────────────────────────────────────────
+    st.markdown("### 🧭 What the Breadth Is Telling You")
+
+    interpretations = []
+    if a50 > 70 and a200 > 60:
+        interpretations.append(("✅", "Broad participation", f"{a50:.0f}% above SMA50, {a200:.0f}% above SMA200 across {total:,} stocks — healthy wide rally", "#00e676"))
+    elif a50 < 40:
+        interpretations.append(("🚨", "Weak breadth", f"Only {a50:.0f}% of {total:,} stocks above SMA50 — indices masking underlying weakness", "#ff5252"))
+
+    if ad > 1.5:
+        interpretations.append(("✅", "Strong advance/decline", f"{breadth['advancing']:,} advancing vs {breadth['declining']:,} declining — broad buying pressure", "#00e676"))
+    elif ad < 0.8:
+        interpretations.append(("🚨", "Distribution signal", f"More stocks declining than advancing — smart money rotating out", "#ff5252"))
+
+    if nh > nl * 3:
+        interpretations.append(("✅", "New highs dominating", f"{nh:,} new 52W highs vs {nl:,} lows — trend firmly intact", "#00e676"))
+    elif nl > nh * 2:
+        interpretations.append(("🚨", "New lows expanding", f"{nl:,} new 52W lows vs {nh:,} highs — trend deteriorating across the market", "#ff5252"))
+
+    # Cap tier divergence check
+    if tier_summary:
+        mega   = tier_summary.get("Mega Cap (>$200B)",    {}).get("above_50_pct", 50)
+        large  = tier_summary.get("Large Cap ($10-200B)", {}).get("above_50_pct", 50)
+        small  = tier_summary.get("Small Cap ($300M-2B)", {}).get("above_50_pct", 50)
+        micro  = tier_summary.get("Micro Cap (<$300M)",   {}).get("above_50_pct", 50)
+        if mega > 65 and small < 45:
+            interpretations.append(("⚠️", "Cap tier divergence", f"Mega caps {mega:.0f}% healthy vs Small caps {small:.0f}% — narrow rally, elevated correction risk", "#ff6b35"))
+        elif small > mega:
+            interpretations.append(("✅", "Small caps leading", f"Small caps {small:.0f}% vs Mega caps {mega:.0f}% — broad risk-on, best breadth signal", "#00e676"))
+
+    if a50 < 45:
+        interpretations.append(("⚠️", "Potential index divergence", f"Only {a50:.0f}% of stocks above SMA50 — if indices near highs, that's a major warning", "#ffd740"))
+
+    if not interpretations:
+        interpretations.append(("➖", "Mixed signals", "No strong directional breadth signal — market in consolidation", "#888"))
+
+    for icon, title, desc, color in interpretations:
+        st.markdown(
+            f'<div style="background:#1c1f26;border-left:4px solid {color};border-radius:0 10px 10px 0;'
+            f'padding:10px 14px;margin-bottom:6px">'
+            f'{icon} <b style="color:{color}">{title}</b> '
+            f'<span style="color:#888;font-size:12px">— {desc}</span>'
+            f'</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: AI NEWS SENTIMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "📰 AI News Sentiment":
+    st.markdown("# 📰 AI News Sentiment")
+    st.caption("Claude reads the latest headlines for each sector and scores the tone — updated every 30 minutes")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        sectors_to_scan = st.multiselect(
+            "Sectors to analyse",
+            list(SECTOR_ETFS.keys()),
+            default=list(SECTOR_ETFS.keys()),
+        )
+    with col2:
+        st.markdown("<div style='margin-top:28px'>", unsafe_allow_html=True)
+        run_news = st.button("🤖 Analyse News", type="primary")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if run_news and sectors_to_scan:
+        with st.spinner(f"Claude is reading headlines for {len(sectors_to_scan)} sectors…"):
+            news_data = fetch_sector_news_and_sentiment(sectors_to_scan)
+
+        if not news_data:
+            st.error("No news data returned.")
+            st.stop()
+
+        # ── Sentiment Overview Bar Chart ──────────────────────────────────────
+        st.markdown("### 📊 Sector Sentiment Scores")
+        sorted_news = sorted(news_data.items(), key=lambda x: x[1]["score"], reverse=True)
+
+        fig_news = go.Figure()
+        fig_news.add_trace(go.Bar(
+            x=[n[0] for n in sorted_news],
+            y=[n[1]["score"] for n in sorted_news],
+            marker_color=[grade_color(n[1]["grade"]) for n in sorted_news],
+            text=[n[1]["grade"] for n in sorted_news],
+            textposition="outside",
+            hovertemplate="<b>%{x}</b><br>Score: %{y}<br><extra></extra>",
+        ))
+        fig_news.add_hline(y=50, line_dash="dash", line_color="#555", opacity=0.5)
+        fig_news.update_layout(
+            height=360,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#ccc", showlegend=False,
+            xaxis=dict(gridcolor="#2d3139", tickangle=-30),
+            yaxis=dict(gridcolor="#2d3139", range=[0, 115], title="Sentiment Score"),
+            margin=dict(t=30, b=80),
+        )
+        st.plotly_chart(fig_news, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Individual Sector Cards ───────────────────────────────────────────
+        st.markdown("### 📋 Sector-by-Sector Breakdown")
+        for row_start in range(0, len(sorted_news), 2):
+            row_items = sorted_news[row_start:row_start + 2]
+            cols = st.columns(2)
+            for i, (sector, data) in enumerate(row_items):
+                gc    = grade_color(data["grade"])
+                score = data["score"]
+                color = SECTOR_COLORS.get(sector, "#5c7cfa")
+
+                with cols[i]:
+                    headlines_html = "".join(
+                        f'<div style="font-size:11px;color:#888;border-left:2px solid #2d3139;'
+                        f'padding-left:8px;margin-bottom:4px">{h}</div>'
+                        for h in data.get("headlines", [])[:4]
+                    )
+                    st.markdown(
+                        f'<div style="background:#1c1f26;border-radius:12px;padding:16px;'
+                        f'border-left:5px solid {color};margin-bottom:12px">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                        f'<div>'
+                        f'<div style="font-size:15px;font-weight:700;color:#ddd">{sector}</div>'
+                        f'<div style="font-size:10px;color:#555">{SECTOR_ETFS.get(sector,"")}</div>'
+                        f'</div>'
+                        f'<div style="text-align:right">'
+                        f'<div style="font-size:22px;font-weight:900;color:{gc}">{score:.0f}</div>'
+                        f'<div style="font-size:10px;color:{gc}">{data["grade"]}</div>'
+                        f'</div></div>'
+                        f'{momentum_bar(int(score), gc)}'
+                        f'<div style="margin-top:10px;font-size:12px;color:#aaa;font-style:italic">'
+                        f'"{data.get("summary","")}"</div>'
+                        f'<div style="margin-top:8px">{headlines_html}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+
+        # ── Combined Technical + News Signal ─────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🎯 Combined Signal: Technical Momentum + News Sentiment")
+        st.caption("Confluence of both signals = higher conviction")
+
+        with st.spinner("Fetching technical momentum…"):
+            tech_data = fetch_etf_momentum(SECTOR_ETFS)
+
+        combo_rows = []
+        for sector in sectors_to_scan:
+            tech = tech_data.get(sector, {})
+            news = news_data.get(sector, {})
+            tech_score = tech.get("score", 50)
+            news_score = news.get("score", 50)
+            combined   = round(tech_score * 0.6 + news_score * 0.4, 1)
+
+            if combined >= 68:   combo_grade, cc = "🟢 Strong Buy",  "#00e676"
+            elif combined >= 55: combo_grade, cc = "🟡 Bullish",     "#ffd740"
+            elif combined >= 45: combo_grade, cc = "⬜ Neutral",     "#888"
+            elif combined >= 32: combo_grade, cc = "🔴 Bearish",     "#ff5252"
+            else:                combo_grade, cc = "🔴 Strong Sell", "#ff1744"
+
+            combo_rows.append({
+                "Sector":        sector,
+                "ETF":           SECTOR_ETFS.get(sector, ""),
+                "Tech Score":    tech_score,
+                "News Score":    news_score,
+                "Combined":      combined,
+                "Signal":        combo_grade,
+                "Tech Grade":    tech.get("grade", ""),
+                "News Grade":    news.get("grade", ""),
+                "Color":         cc,
+            })
+
+        combo_df = pd.DataFrame(combo_rows).sort_values("Combined", ascending=False)
+
+        for _, row in combo_df.iterrows():
+            cc = row["Color"]
+            st.markdown(
+                f'<div style="background:#1c1f26;border-radius:10px;padding:12px 16px;'
+                f'margin-bottom:6px;border-left:4px solid {cc}">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<div>'
+                f'<span style="font-size:15px;font-weight:700;color:#ddd">{row["Sector"]}</span>'
+                f' <span style="font-size:10px;color:#555">{row["ETF"]}</span><br>'
+                f'<span style="font-size:11px;color:#888">'
+                f'Technical: <b style="color:{grade_color(row["Tech Grade"])}">{row["Tech Score"]}</b>'
+                f' · News: <b style="color:{grade_color(row["News Grade"])}">{row["News Score"]:.0f}</b>'
+                f'</span>'
+                f'</div>'
+                f'<div style="text-align:right">'
+                f'<span style="font-size:20px;font-weight:900;color:{cc}">{row["Combined"]:.0f}</span>'
+                f'<br><span style="font-size:11px;color:{cc}">{row["Signal"]}</span>'
+                f'</div></div>'
+                f'{momentum_bar(int(row["Combined"]), cc)}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+        st.caption("Combined = 60% technical momentum + 40% news sentiment · Higher weight on technicals as they are more objective")
+
+    else:
+        st.info("Select sectors above and click **Analyse News** to run the AI sentiment scan.")
+        st.markdown("### 💡 What this module does")
+        st.markdown("""
+- Fetches the **latest financial headlines** for each sector ETF via Yahoo Finance
+- Sends them to **Claude** which reads and scores the overall tone
+- Combines with **technical momentum** for a unified signal
+- Identifies **sector-level catalysts** you might have missed
+- Updates every **30 minutes** (cached)
+        """)
