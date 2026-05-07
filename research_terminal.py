@@ -3896,17 +3896,27 @@ The goal is not to tell you to sell everything — it's to flag the positions mo
 
     # Fetch portfolio signals
     YOUR_TFSA = {
-        "AAPL": "Tech / Software", "ABCL": "Biotech & Health Tech",
-        "AMZN": "AI Infrastructure", "APLD": "AI Infrastructure",
-        "ASML": "Semiconductors", "BBAI": "AI Applications",
-        "CRWV": "AI Infrastructure", "ENB": "Energy & Utilities",
-        "LUNR": "Space, Aerospace & Defence", "META": "AI Infrastructure",
-        "MSFT": "AI Infrastructure", "NNE": "Nuclear & Uranium",
-        "NVDA": "Semiconductors", "OKLO": "Nuclear & Uranium",
-        "QBTS": "Quantum Computing", "RGTI": "Quantum Computing",
-        "SOUN": "AI Applications", "TSLA": "Tech / Software",
-        "VFV": "Core ETFs", "WPM": "Precious Metals & Mining",
-        "RXRX": "Biotech & Health Tech", "RDDT": "Fintech, Platforms & Compounders",
+    "MSFT.TO":"AI Infrastructure","AMZN.TO":"AI Infrastructure","META.TO":"AI Infrastructure",
+    "APLD":"AI Infrastructure","CRWV":"AI Infrastructure","BBAI":"AI Applications",
+    "SOUN":"AI Applications","TEM":"AI Applications","VFV.TO":"Core ETFs","ZCN.TO":"Core ETFs",
+    "XEF.TO":"Core ETFs","VEE.TO":"Core ETFs","XID.TO":"Core ETFs","XSU.TO":"Core ETFs",
+    "ZJPN.TO":"Core ETFs","VNM":"Core ETFs","NNE":"Nuclear & Uranium","OKLO":"Nuclear & Uranium",
+    "CEGS.TO":"Nuclear & Uranium","LUNR":"Space, Aerospace & Defence","RDW":"Space, Aerospace & Defence",
+    "MDA.TO":"Space, Aerospace & Defence","LMT.TO":"Space, Aerospace & Defence",
+    "JOBY":"Space, Aerospace & Defence","PNG.V":"Space, Aerospace & Defence",
+    "QBTS":"Quantum Computing","RGTI":"Quantum Computing","WPM.TO":"Precious Metals & Mining",
+    "COPP.TO":"Precious Metals & Mining","ABCL":"Biotech & Health Tech","RXRX":"Biotech & Health Tech",
+    "CMPS":"Biotech & Health Tech","RARE":"Biotech & Health Tech","IMVT":"Biotech & Health Tech",
+    "DRUG.CN":"Biotech & Health Tech","HELP":"Biotech & Health Tech","WELL.TO":"Biotech & Health Tech",
+    "ISRG.NE":"Biotech & Health Tech","NU":"Fintech, Platforms & Compounders",
+    "RDDT":"Fintech, Platforms & Compounders","BAM.TO":"Fintech, Platforms & Compounders",
+    "BRK.TO":"Fintech, Platforms & Compounders","TOI.V":"Fintech, Platforms & Compounders",
+    "CRCL":"Fintech, Platforms & Compounders","ENB.TO":"Energy & Utilities","CU.TO":"Energy & Utilities",
+    "BEP-UN.TO":"Energy & Utilities","EOSE":"Energy & Utilities","NXT":"Energy & Utilities",
+    "ONE.V":"Speculative / Micro-Cap","PHOS.CN":"Speculative / Micro-Cap","SCD.V":"Speculative / Micro-Cap",
+    "TMC":"Speculative / Micro-Cap","CLBT":"Speculative / Micro-Cap","AAPL.TO":"Tech / Software",
+    "TSLA.TO":"Tech / Software","APPS.TO":"Tech / Software","NVDA.TO":"Semiconductors",
+    "ASML.TO":"Semiconductors","NVTS":"Semiconductors","AEHR":"Semiconductors",
     }
 
     with st.spinner("Fetching signals for your portfolio positions…"):
